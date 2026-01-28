@@ -1,20 +1,5 @@
-/****************************************************
- * Bandware Zähler – ESP32-S3 + 7" 800x480 RGB + LVGL
- * UI: Deutsch, Orange/Weiß, industriell, animiert
- *
- * Funktionen:
- *  - Zielmenge 1..1000 (Keypad)
- *  - START/STOP/RESET
- *  - Sensorzählung via PC817 (open-collector)
- *  - Motor EIN/AUS (MOSFET/SSR)
- *  - Entprellung einstellbar
- *  - Persistenz (Ziel, Entprellung, Helligkeit)
- *  - Failsafe + Watchdog -> Motor AUS bei Fehler
- ****************************************************/
-
 #include <Arduino.h>
 #include <Preferences.h>
-
 #include <lvgl.h>
 
 #define LGFX_USE_V1
@@ -33,25 +18,23 @@ static const int TARGET_MAX = 1000;
 
 static const int SCREEN_W = 800;
 static const int SCREEN_H = 480;
-
-/* LVGL Buffer: mehr Linien = smoother, braucht mehr RAM */
 static const int LVGL_BUF_LINES = 40;
 
-/* 0 = Preset A (häufiges 7" ESP32-S3 HMI)
-   1 = Preset B (Template: an dein Board anpassen) */
+// 0 = Preset A (رایج‌ترین 7" ESP32-S3 HMI)
+// 1 = Preset B (Template: پین‌ها/تایمینگ را از فروشنده جایگزین کن)
 static const int DISPLAY_PRESET = 0;
 
-// Touch GT911 Default (kann je nach Board abweichen)
+// Touch GT911 (معمولاً همین است)
 static const int TOUCH_I2C_SDA = 19;
 static const int TOUCH_I2C_SCL = 20;
 static const int TOUCH_RST_PIN = 38;
 static const int TOUCH_INT_PIN = -1;
 
-// Backlight Pin (kann abweichen)
+// Backlight
 static const int BL_PIN = 2;
 
-// NVS Defaults
-static uint32_t debounce_ms = 3;  // 1..50
+// Settings (NVS)
+static uint32_t debounce_ms = 3;   // 1..50
 static uint8_t  brightness = 220; // 10..255
 
 // Safety
@@ -68,7 +51,6 @@ public:
   lgfx::Touch_GT911 touch;
 
   LGFX() {
-    // Panel basic
     {
       auto cfg = panel.config();
       cfg.memory_width  = SCREEN_W;
@@ -85,13 +67,12 @@ public:
       panel.config_detail(cfg);
     }
 
-    // RGB bus config
     {
       auto cfg = bus.config();
       cfg.panel = &panel;
 
       if (DISPLAY_PRESET == 0) {
-        // ---------- PRESET A (häufiges Mapping) ----------
+        // ---------- PRESET A ----------
         cfg.pin_d0  = GPIO_NUM_15;
         cfg.pin_d1  = GPIO_NUM_7;
         cfg.pin_d2  = GPIO_NUM_6;
@@ -114,7 +95,7 @@ public:
         cfg.pin_hsync   = GPIO_NUM_39; // HSYNC
         cfg.pin_pclk    = GPIO_NUM_42; // PCLK
 
-        cfg.freq_write = 12000000;     // 12 MHz
+        cfg.freq_write = 12000000;
 
         cfg.hsync_polarity    = 0;
         cfg.hsync_front_porch = 8;
@@ -128,8 +109,7 @@ public:
 
         cfg.pclk_idle_high = 1;
       } else {
-        // ---------- PRESET B (Template: anpassen) ----------
-        // -> Hier Pins & Timings vom Verkäufer übernehmen
+        // ---------- PRESET B (Template: از Pinout فروشنده جایگزین کن) ----------
         cfg.pin_d0  = GPIO_NUM_8;
         cfg.pin_d1  = GPIO_NUM_9;
         cfg.pin_d2  = GPIO_NUM_10;
@@ -172,7 +152,6 @@ public:
 
     panel.setBus(&bus);
 
-    // Backlight
     {
       auto cfg = light.config();
       cfg.pin_bl = (lgfx::pin_t)BL_PIN;
@@ -180,7 +159,6 @@ public:
       panel.light(&light);
     }
 
-    // Touch (GT911)
     {
       auto cfg = touch.config();
       cfg.x_min = 0; cfg.y_min = 0;
@@ -190,10 +168,10 @@ public:
       cfg.offset_rotation = 0;
 
       cfg.i2c_port = I2C_NUM_0;
-      cfg.pin_sda  = (lgfx::pin_t)TOUCH_I2C_SDA;
-      cfg.pin_scl  = (lgfx::pin_t)TOUCH_I2C_SCL;
-      cfg.pin_int  = (TOUCH_INT_PIN < 0) ? GPIO_NUM_NC : (lgfx::pin_t)TOUCH_INT_PIN;
-      cfg.pin_rst  = (TOUCH_RST_PIN < 0) ? GPIO_NUM_NC : (lgfx::pin_t)TOUCH_RST_PIN;
+      cfg.pin_sda = (lgfx::pin_t)TOUCH_I2C_SDA;
+      cfg.pin_scl = (lgfx::pin_t)TOUCH_I2C_SCL;
+      cfg.pin_int = (TOUCH_INT_PIN < 0) ? GPIO_NUM_NC : (lgfx::pin_t)TOUCH_INT_PIN;
+      cfg.pin_rst = (TOUCH_RST_PIN < 0) ? GPIO_NUM_NC : (lgfx::pin_t)TOUCH_RST_PIN;
       cfg.freq = 100000;
 
       touch.config(cfg);
@@ -206,7 +184,7 @@ public:
 
 static LGFX gfx;
 
-// =============== LVGL Glue ===============
+// =============== LVGL glue ===============
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t* lv_buf1 = nullptr;
 
@@ -234,7 +212,7 @@ static void lv_touch_read_cb(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   }
 }
 
-// =============== State Machine ===============
+// =============== App logic ===============
 enum class State : uint8_t { IDLE, RUNNING, DONE, STOPPED, ERROR };
 static State state = State::IDLE;
 
@@ -272,7 +250,6 @@ static lv_color_t C_ORANGE, C_WHITE, C_BG, C_TEXT, C_RED;
 
 static void motor_set(bool on) { digitalWrite(GPIO_MOTOR, on ? HIGH : LOW); }
 
-// ISR Sensor (Entprellung)
 static void IRAM_ATTR isr_sensor() {
   uint32_t now = millis();
   if (now - g_last_ms < debounce_ms) return;
@@ -315,7 +292,7 @@ static void ui_set_status(State s) {
   state = s;
   lv_label_set_text(label_status, state_text(state));
 
-  // Fade-in Animation
+  // fade animation
   lv_anim_t a;
   lv_anim_init(&a);
   lv_anim_set_var(&a, label_status);
@@ -371,16 +348,13 @@ static void animate_button_press(lv_obj_t* btn) {
   lv_anim_start(&a);
 }
 
-// UI Callbacks
 static void btn_start_cb(lv_event_t* e) { (void)e; animate_button_press(btn_start); if (state != State::RUNNING) start_run(); }
 static void btn_stop_cb (lv_event_t* e) { (void)e; animate_button_press(btn_stop);  if (state == State::RUNNING) stop_run(State::STOPPED); }
 static void btn_reset_cb(lv_event_t* e) { (void)e; animate_button_press(btn_reset); motor_set(false); g_count = 0; ui_set_status(State::IDLE); ui_update_numbers(); }
 
 static void kb_event_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
-  if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
-  }
+  if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
 }
 static void ta_event_cb(lv_event_t* e) {
   if (lv_event_get_code(e) == LV_EVENT_FOCUSED) {
@@ -530,7 +504,6 @@ static void create_ui() {
   lv_obj_set_style_text_font(label_status, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(label_status, C_ORANGE, 0);
   lv_obj_align(label_status, LV_ALIGN_TOP_LEFT, 24, 350);
-  lv_label_set_text(label_status, "Bereit");
 
   label_count = lv_label_create(scr);
   lv_obj_set_style_text_font(label_count, &lv_font_montserrat_28, 0);
@@ -588,12 +561,7 @@ static void create_ui() {
   lv_slider_set_value(slider_debounce, debounce_ms, LV_ANIM_OFF);
   lv_obj_add_event_cb(slider_debounce, slider_deb_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
-  char b1[48], b2[48];
-  snprintf(b1, sizeof(b1), "Helligkeit: %u", brightness);
-  snprintf(b2, sizeof(b2), "Entprellung: %lu ms", (unsigned long)debounce_ms);
-  lv_label_set_text(label_bri, b1);
-  lv_label_set_text(label_deb, b2);
-
+  ui_set_status(State::IDLE);
   ui_update_numbers();
 }
 
@@ -654,7 +622,6 @@ void setup() {
   init_lvgl();
   init_styles();
   create_ui();
-  ui_set_status(State::IDLE);
 
   if (ENABLE_WDT) {
     esp_task_wdt_init(3, true);
