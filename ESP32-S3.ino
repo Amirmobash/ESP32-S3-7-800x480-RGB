@@ -1,19 +1,15 @@
 /****************************************************
  * Bandware Zähler – ESP32-S3 + 7" 800x480 RGB + LVGL
  * UI: Deutsch, Orange/Weiß, industriell, animiert
- * Funktionen:
- *  - Zielmenge (1..1000) eingeben (On-Screen Keypad)
- *  - START/STOP/RESET
- *  - Zählen über Sensor (PC817 -> GPIO, open-collector)
- *  - Motor EIN/AUS (MOSFET/SSR-DC)
- *  - Entprellung (ms)
- *  - Zustandsmaschine (IDLE/RUNNING/DONE/STOPPED/ERROR)
- *  - Persistenz (letzte Zielmenge, Debounce, Helligkeit)
- *  - Failsafe & Watchdog: bei UI-Hänger -> Motor AUS
  *
- * Hinweis:
- *  - RGB Pinmapping & Timings sind boardabhängig.
- *  - In CONFIG: DISPLAY_PRESET auswählen/Pinmap anpassen.
+ * Funktionen:
+ *  - Zielmenge 1..1000 (Keypad)
+ *  - START/STOP/RESET
+ *  - Sensorzählung via PC817 (open-collector)
+ *  - Motor EIN/AUS (MOSFET/SSR)
+ *  - Entprellung einstellbar
+ *  - Persistenz (Ziel, Entprellung, Helligkeit)
+ *  - Failsafe + Watchdog -> Motor AUS bei Fehler
  ****************************************************/
 
 #include <Arduino.h>
@@ -26,48 +22,42 @@
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
 
-// Optional Watchdog (ESP-IDF)
 #include "esp_task_wdt.h"
 
 // ========================= CONFIG =========================
-
-// ---- IO Pins (freie GPIOs wählen, die nicht vom RGB Bus belegt sind!) ----
 static const int GPIO_MOTOR  = 17;   // HIGH = Motor ON
-static const int GPIO_SENSOR = 18;   // Sensorpuls (PC817 OUT) -> Interrupt FALLING
+static const int GPIO_SENSOR = 18;   // PC817 OUT -> GPIO (Interrupt FALLING)
 
-// Zielbereich
 static const int TARGET_MIN = 1;
 static const int TARGET_MAX = 1000;
 
-// Display
 static const int SCREEN_W = 800;
 static const int SCREEN_H = 480;
-static const int LVGL_BUF_LINES = 40; // mehr = flüssiger, braucht mehr RAM
 
-// Display Preset Auswahl:
-// 0 = Preset A (häufiges 7" ESP32-S3 HMI "Sunton-Style")
-// 1 = Preset B (eigene Pins/Timings)
+/* LVGL Buffer: mehr Linien = smoother, braucht mehr RAM */
+static const int LVGL_BUF_LINES = 40;
+
+/* 0 = Preset A (häufiges 7" ESP32-S3 HMI)
+   1 = Preset B (Template: an dein Board anpassen) */
 static const int DISPLAY_PRESET = 0;
 
-// Touch (GT911) I2C Config (falls abweichend, hier ändern)
+// Touch GT911 Default (kann je nach Board abweichen)
 static const int TOUCH_I2C_SDA = 19;
 static const int TOUCH_I2C_SCL = 20;
-static const int TOUCH_RST_PIN = 38;   // manche Boards haben Reset-Pin
-static const int TOUCH_INT_PIN = -1;   // oft NC
+static const int TOUCH_RST_PIN = 38;
+static const int TOUCH_INT_PIN = -1;
 
-// Backlight Pin (falls abweichend, hier ändern)
+// Backlight Pin (kann abweichen)
 static const int BL_PIN = 2;
 
-// Default Parameter (werden aus NVS überschrieben)
-static uint32_t debounce_ms = 3;
-static uint8_t  brightness = 220; // 0..255
+// NVS Defaults
+static uint32_t debounce_ms = 3;  // 1..50
+static uint8_t  brightness = 220; // 10..255
 
-// Watchdog / Failsafe
-static const uint32_t UI_HEARTBEAT_TIMEOUT_MS = 1500; // wenn LVGL nicht "lebt" -> Motor AUS
+// Safety
+static const uint32_t UI_HEARTBEAT_TIMEOUT_MS = 1500;
 static const bool ENABLE_WDT = true;
-
 // ==========================================================
-
 
 // =============== Display Driver (LovyanGFX RGB) ===============
 class LGFX : public lgfx::LGFX_Device {
@@ -78,7 +68,7 @@ public:
   lgfx::Touch_GT911 touch;
 
   LGFX() {
-    // Panel
+    // Panel basic
     {
       auto cfg = panel.config();
       cfg.memory_width  = SCREEN_W;
@@ -95,14 +85,13 @@ public:
       panel.config_detail(cfg);
     }
 
-    // RGB Bus
+    // RGB bus config
     {
       auto cfg = bus.config();
       cfg.panel = &panel;
 
       if (DISPLAY_PRESET == 0) {
-        // ---------- PRESET A (sehr häufiges 7" ESP32-S3 HMI 800x480) ----------
-        // D0..D15 (RGB565) + DE/VSYNC/HSYNC/PCLK
+        // ---------- PRESET A (häufiges Mapping) ----------
         cfg.pin_d0  = GPIO_NUM_15;
         cfg.pin_d1  = GPIO_NUM_7;
         cfg.pin_d2  = GPIO_NUM_6;
@@ -125,7 +114,7 @@ public:
         cfg.pin_hsync   = GPIO_NUM_39; // HSYNC
         cfg.pin_pclk    = GPIO_NUM_42; // PCLK
 
-        cfg.freq_write = 12000000;     // Pixelclock ~12MHz (stabil bei vielen 7" TN)
+        cfg.freq_write = 12000000;     // 12 MHz
 
         cfg.hsync_polarity    = 0;
         cfg.hsync_front_porch = 8;
@@ -139,8 +128,8 @@ public:
 
         cfg.pclk_idle_high = 1;
       } else {
-        // ---------- PRESET B (DEIN BOARD: Pins & Timings hier eintragen) ----------
-        // TODO: Anpassen nach Pinout/Demo des Verkäufers
+        // ---------- PRESET B (Template: anpassen) ----------
+        // -> Hier Pins & Timings vom Verkäufer übernehmen
         cfg.pin_d0  = GPIO_NUM_8;
         cfg.pin_d1  = GPIO_NUM_9;
         cfg.pin_d2  = GPIO_NUM_10;
@@ -194,10 +183,8 @@ public:
     // Touch (GT911)
     {
       auto cfg = touch.config();
-      cfg.x_min = 0;
-      cfg.y_min = 0;
-      cfg.x_max = SCREEN_W;
-      cfg.y_max = SCREEN_H;
+      cfg.x_min = 0; cfg.y_min = 0;
+      cfg.x_max = SCREEN_W; cfg.y_max = SCREEN_H;
 
       cfg.bus_shared = false;
       cfg.offset_rotation = 0;
@@ -207,7 +194,7 @@ public:
       cfg.pin_scl  = (lgfx::pin_t)TOUCH_I2C_SCL;
       cfg.pin_int  = (TOUCH_INT_PIN < 0) ? GPIO_NUM_NC : (lgfx::pin_t)TOUCH_INT_PIN;
       cfg.pin_rst  = (TOUCH_RST_PIN < 0) ? GPIO_NUM_NC : (lgfx::pin_t)TOUCH_RST_PIN;
-      cfg.freq     = 100000;
+      cfg.freq = 100000;
 
       touch.config(cfg);
       panel.setTouch(&touch);
@@ -247,23 +234,19 @@ static void lv_touch_read_cb(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   }
 }
 
-// =============== App State Machine ===============
+// =============== State Machine ===============
 enum class State : uint8_t { IDLE, RUNNING, DONE, STOPPED, ERROR };
 static State state = State::IDLE;
 
 static Preferences prefs;
 
-// Zähler (ISR)
 volatile uint32_t g_count = 0;
 volatile uint32_t g_last_ms = 0;
-
-// Ziel
 static int target = 100;
 
-// UI heartbeat (Failsafe)
 static uint32_t last_ui_heartbeat_ms = 0;
 
-// =============== UI Objects ===============
+// UI objects
 static lv_obj_t* label_status;
 static lv_obj_t* label_count;
 static lv_obj_t* label_target;
@@ -283,43 +266,25 @@ static lv_obj_t* slider_debounce;
 static lv_obj_t* label_deb;
 static lv_obj_t* label_bri;
 
-// =============== Styles (Orange/Weiß) ===============
-static lv_style_t st_btn_orange;
-static lv_style_t st_btn_white;
-static lv_style_t st_btn_red;
-static lv_style_t st_card;
-static lv_style_t st_title;
-static lv_style_t st_label;
+// Styles/colors
+static lv_style_t st_btn_orange, st_btn_white, st_btn_red, st_card, st_title;
+static lv_color_t C_ORANGE, C_WHITE, C_BG, C_TEXT, C_RED;
 
-// Farben
-static lv_color_t C_ORANGE;
-static lv_color_t C_WHITE;
-static lv_color_t C_BG;
-static lv_color_t C_TEXT;
-static lv_color_t C_RED;
+static void motor_set(bool on) { digitalWrite(GPIO_MOTOR, on ? HIGH : LOW); }
 
-// ===== Motor control (failsafe) =====
-static void motor_set(bool on) {
-  digitalWrite(GPIO_MOTOR, on ? HIGH : LOW);
-}
-
-// ===== Sensor ISR =====
+// ISR Sensor (Entprellung)
 static void IRAM_ATTR isr_sensor() {
   uint32_t now = millis();
   if (now - g_last_ms < debounce_ms) return;
   g_last_ms = now;
-
-  if (state == State::RUNNING) {
-    g_count++;
-  }
+  if (state == State::RUNNING) g_count++;
 }
 
-// ===== Helpers =====
 static const char* state_text(State s) {
   switch (s) {
     case State::IDLE:    return "Bereit";
     case State::RUNNING: return "Läuft…";
-    case State::DONE:    return "Fertig";
+    case State::DONE:    return "Fertig: Bitte Band entnehmen";
     case State::STOPPED: return "Stopp";
     case State::ERROR:   return "Fehler";
     default:             return "—";
@@ -336,21 +301,21 @@ static void load_settings() {
   target      = prefs.getInt("target", 100);
   debounce_ms = prefs.getUInt("deb", 3);
   brightness  = prefs.getUChar("bri", 220);
+
   if (target < TARGET_MIN) target = TARGET_MIN;
   if (target > TARGET_MAX) target = TARGET_MAX;
   if (debounce_ms < 1) debounce_ms = 1;
   if (debounce_ms > 50) debounce_ms = 50;
+  if (brightness < 10) brightness = 10;
 }
 
-static void apply_brightness() {
-  gfx.setBrightness(brightness);
-}
+static void apply_brightness() { gfx.setBrightness(brightness); }
 
 static void ui_set_status(State s) {
   state = s;
   lv_label_set_text(label_status, state_text(state));
 
-  // kleine Status-Animation (Fade)
+  // Fade-in Animation
   lv_anim_t a;
   lv_anim_init(&a);
   lv_anim_set_var(&a, label_status);
@@ -366,7 +331,6 @@ static void ui_update_numbers() {
   char buf1[64], buf2[64];
   snprintf(buf1, sizeof(buf1), "IST: %lu", (unsigned long)g_count);
   snprintf(buf2, sizeof(buf2), "ZIEL: %d", target);
-
   lv_label_set_text(label_count, buf1);
   lv_label_set_text(label_target, buf2);
 
@@ -383,7 +347,6 @@ static void stop_run(State next) {
 }
 
 static void start_run() {
-  // Ziel aus Textfeld
   int v = atoi(lv_textarea_get_text(ta_target));
   if (v < TARGET_MIN) v = TARGET_MIN;
   if (v > TARGET_MAX) v = TARGET_MAX;
@@ -395,9 +358,7 @@ static void start_run() {
   save_settings();
 }
 
-// ===== Button press animation helper =====
 static void animate_button_press(lv_obj_t* btn) {
-  // scale down/up effect via transform zoom
   lv_anim_t a;
   lv_anim_init(&a);
   lv_anim_set_var(&a, btn);
@@ -410,25 +371,10 @@ static void animate_button_press(lv_obj_t* btn) {
   lv_anim_start(&a);
 }
 
-// ===== UI callbacks =====
-static void btn_start_cb(lv_event_t* e) {
-  animate_button_press(btn_start);
-  if (state == State::RUNNING) return;
-  start_run();
-}
-
-static void btn_stop_cb(lv_event_t* e) {
-  animate_button_press(btn_stop);
-  if (state == State::RUNNING) stop_run(State::STOPPED);
-}
-
-static void btn_reset_cb(lv_event_t* e) {
-  animate_button_press(btn_reset);
-  motor_set(false);
-  g_count = 0;
-  ui_set_status(State::IDLE);
-  ui_update_numbers();
-}
+// UI Callbacks
+static void btn_start_cb(lv_event_t* e) { (void)e; animate_button_press(btn_start); if (state != State::RUNNING) start_run(); }
+static void btn_stop_cb (lv_event_t* e) { (void)e; animate_button_press(btn_stop);  if (state == State::RUNNING) stop_run(State::STOPPED); }
+static void btn_reset_cb(lv_event_t* e) { (void)e; animate_button_press(btn_reset); motor_set(false); g_count = 0; ui_set_status(State::IDLE); ui_update_numbers(); }
 
 static void kb_event_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
@@ -436,7 +382,6 @@ static void kb_event_cb(lv_event_t* e) {
     lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
   }
 }
-
 static void ta_event_cb(lv_event_t* e) {
   if (lv_event_get_code(e) == LV_EVENT_FOCUSED) {
     lv_keyboard_set_textarea(kb, ta_target);
@@ -445,21 +390,18 @@ static void ta_event_cb(lv_event_t* e) {
 }
 
 static void toggle_settings(bool show) {
-  if (show) {
-    lv_obj_clear_flag(panel_settings, LV_OBJ_FLAG_HIDDEN);
-  } else {
-    lv_obj_add_flag(panel_settings, LV_OBJ_FLAG_HIDDEN);
-  }
+  if (show) lv_obj_clear_flag(panel_settings, LV_OBJ_FLAG_HIDDEN);
+  else      lv_obj_add_flag(panel_settings, LV_OBJ_FLAG_HIDDEN);
 }
-
 static void btn_settings_cb(lv_event_t* e) {
+  (void)e;
   animate_button_press(btn_settings);
   bool hidden = lv_obj_has_flag(panel_settings, LV_OBJ_FLAG_HIDDEN);
   toggle_settings(hidden);
 }
 
-// Slider events
 static void slider_bri_cb(lv_event_t* e) {
+  (void)e;
   brightness = (uint8_t)lv_slider_get_value(slider_bright);
   char b[48];
   snprintf(b, sizeof(b), "Helligkeit: %u", brightness);
@@ -467,8 +409,8 @@ static void slider_bri_cb(lv_event_t* e) {
   apply_brightness();
   save_settings();
 }
-
 static void slider_deb_cb(lv_event_t* e) {
+  (void)e;
   debounce_ms = (uint32_t)lv_slider_get_value(slider_debounce);
   char b[48];
   snprintf(b, sizeof(b), "Entprellung: %lu ms", (unsigned long)debounce_ms);
@@ -476,7 +418,6 @@ static void slider_deb_cb(lv_event_t* e) {
   save_settings();
 }
 
-// =============== UI Build ===============
 static void init_styles() {
   C_ORANGE = lv_color_hex(0xFF7A00);
   C_WHITE  = lv_color_hex(0xFFFFFF);
@@ -487,10 +428,6 @@ static void init_styles() {
   lv_style_init(&st_title);
   lv_style_set_text_font(&st_title, &lv_font_montserrat_28);
   lv_style_set_text_color(&st_title, C_TEXT);
-
-  lv_style_init(&st_label);
-  lv_style_set_text_font(&st_label, &lv_font_montserrat_22);
-  lv_style_set_text_color(&st_label, C_TEXT);
 
   lv_style_init(&st_card);
   lv_style_set_radius(&st_card, 18);
@@ -540,7 +477,6 @@ static lv_obj_t* make_button(lv_obj_t* parent, const char* txt, lv_style_t* st, 
   lv_label_set_text(l, txt);
   lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
   lv_obj_center(l);
-
   return b;
 }
 
@@ -549,7 +485,6 @@ static void create_ui() {
   lv_obj_set_style_bg_color(scr, C_BG, 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-  // Header
   lv_obj_t* title = lv_label_create(scr);
   lv_obj_add_style(title, &st_title, 0);
   lv_label_set_text(title, "Bandware Zähler");
@@ -559,14 +494,13 @@ static void create_ui() {
   lv_obj_align(btn_settings, LV_ALIGN_TOP_RIGHT, -24, 12);
   lv_obj_add_event_cb(btn_settings, btn_settings_cb, LV_EVENT_CLICKED, nullptr);
 
-  // Card main
   lv_obj_t* card = lv_obj_create(scr);
   lv_obj_add_style(card, &st_card, 0);
   lv_obj_set_size(card, 760, 250);
   lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 80);
 
   lv_obj_t* lbl = lv_label_create(card);
-  lv_obj_add_style(lbl, &st_label, 0);
+  lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
   lv_label_set_text(lbl, "Zielmenge (1..1000):");
   lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
@@ -580,7 +514,6 @@ static void create_ui() {
   lv_obj_align(ta_target, LV_ALIGN_TOP_LEFT, 0, 44);
   lv_obj_add_event_cb(ta_target, ta_event_cb, LV_EVENT_ALL, nullptr);
 
-  // Buttons row
   btn_start = make_button(card, "START", &st_btn_orange, 200, 70);
   lv_obj_align(btn_start, LV_ALIGN_TOP_LEFT, 0, 120);
   lv_obj_add_event_cb(btn_start, btn_start_cb, LV_EVENT_CLICKED, nullptr);
@@ -593,7 +526,6 @@ static void create_ui() {
   lv_obj_align(btn_reset, LV_ALIGN_TOP_LEFT, 440, 120);
   lv_obj_add_event_cb(btn_reset, btn_reset_cb, LV_EVENT_CLICKED, nullptr);
 
-  // Status / Counters
   label_status = lv_label_create(scr);
   lv_obj_set_style_text_font(label_status, &lv_font_montserrat_24, 0);
   lv_obj_set_style_text_color(label_status, C_ORANGE, 0);
@@ -610,7 +542,6 @@ static void create_ui() {
   lv_obj_set_style_text_color(label_target, lv_color_hex(0x374151), 0);
   lv_obj_align(label_target, LV_ALIGN_TOP_LEFT, 24, 432);
 
-  // Progress bar
   bar_progress = lv_bar_create(scr);
   lv_obj_set_size(bar_progress, 420, 26);
   lv_obj_align(bar_progress, LV_ALIGN_TOP_RIGHT, -24, 400);
@@ -622,7 +553,6 @@ static void create_ui() {
   lv_obj_set_style_bg_color(bar_progress, C_ORANGE, LV_PART_INDICATOR);
   lv_obj_set_style_radius(bar_progress, 14, LV_PART_INDICATOR);
 
-  // On-screen keypad (LVGL keyboard)
   kb = lv_keyboard_create(scr);
   lv_obj_set_size(kb, 760, 200);
   lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -630,7 +560,6 @@ static void create_ui() {
   lv_obj_add_event_cb(kb, kb_event_cb, LV_EVENT_ALL, nullptr);
   lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
 
-  // Settings panel
   panel_settings = lv_obj_create(scr);
   lv_obj_add_style(panel_settings, &st_card, 0);
   lv_obj_set_size(panel_settings, 760, 180);
@@ -659,7 +588,6 @@ static void create_ui() {
   lv_slider_set_value(slider_debounce, debounce_ms, LV_ANIM_OFF);
   lv_obj_add_event_cb(slider_debounce, slider_deb_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
-  // init labels
   char b1[48], b2[48];
   snprintf(b1, sizeof(b1), "Helligkeit: %u", brightness);
   snprintf(b2, sizeof(b2), "Entprellung: %lu ms", (unsigned long)debounce_ms);
@@ -669,11 +597,9 @@ static void create_ui() {
   ui_update_numbers();
 }
 
-// =============== Setup/Loop ===============
 static void init_lvgl() {
   lv_init();
 
-  // Draw buffer (PSRAM bevorzugt)
   lv_buf1 = (lv_color_t*)heap_caps_malloc(SCREEN_W * LVGL_BUF_LINES * sizeof(lv_color_t),
                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!lv_buf1) {
@@ -699,12 +625,11 @@ static void init_lvgl() {
 }
 
 static void failsafe_check() {
-  // Wenn UI nicht mehr "lebt" -> Motor aus
   uint32_t now = millis();
   if (state == State::RUNNING) {
     if (now - last_ui_heartbeat_ms > UI_HEARTBEAT_TIMEOUT_MS) {
       motor_set(false);
-      state = State::ERROR;
+      ui_set_status(State::ERROR);
     }
   }
 }
@@ -713,32 +638,25 @@ void setup() {
   Serial.begin(115200);
   delay(50);
 
-  // IO
   pinMode(GPIO_MOTOR, OUTPUT);
   motor_set(false);
 
-  // Sensor: PC817 open-collector -> Pullup
   pinMode(GPIO_SENSOR, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(GPIO_SENSOR), isr_sensor, FALLING);
 
-  // Persistenz
   prefs.begin("bandware", false);
   load_settings();
 
-  // Display init
   gfx.init();
   gfx.setRotation(0);
   apply_brightness();
 
-  // LVGL init
   init_lvgl();
   init_styles();
   create_ui();
   ui_set_status(State::IDLE);
 
-  // Watchdog
   if (ENABLE_WDT) {
-    // 3 Sekunden WDT
     esp_task_wdt_init(3, true);
     esp_task_wdt_add(NULL);
   }
@@ -748,26 +666,18 @@ void setup() {
 }
 
 void loop() {
-  // LVGL tick
   lv_timer_handler();
   delay(5);
 
-  // UI heartbeat (für Failsafe)
   last_ui_heartbeat_ms = millis();
+  if (ENABLE_WDT) esp_task_wdt_reset();
 
-  // Watchdog feed
-  if (ENABLE_WDT) {
-    esp_task_wdt_reset();
-  }
-
-  // Lauf-Logik
   if (state == State::RUNNING) {
     if ((int)g_count >= target) {
       stop_run(State::DONE);
     }
   }
 
-  // UI Refresh (nicht zu oft)
   static uint32_t lastUi = 0;
   uint32_t now = millis();
   if (now - lastUi > 100) {
@@ -775,6 +685,5 @@ void loop() {
     ui_update_numbers();
   }
 
-  // Failsafe check
   failsafe_check();
 }
