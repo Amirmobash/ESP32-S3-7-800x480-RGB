@@ -13,47 +13,32 @@
 static const int GPIO_MOTOR  = 17;   // HIGH = Motor ON
 static const int GPIO_SENSOR = 18;   // PC817 OUT -> GPIO (Interrupt FALLING)
 
+static const int TARGET_MIN = 1;
+static const int TARGET_MAX = 1000;
+
 static const int SCREEN_W = 800;
 static const int SCREEN_H = 480;
 static const int LVGL_BUF_LINES = 40;
 
-static const int TARGET_MIN = 1;
-static const int TARGET_MAX = 1000;
+static const int DISPLAY_PRESET = 0; // اگر تصویر نیامد، Pinmap/Timing باید مطابق برد شود
 
-static const int DISPLAY_PRESET = 0;
-
-// Touch GT911 default
+// Touch GT911 (ممکن است روی برد شما فرق کند)
 static const int TOUCH_I2C_SDA = 19;
 static const int TOUCH_I2C_SCL = 20;
 static const int TOUCH_RST_PIN = 38;
 static const int TOUCH_INT_PIN = -1;
 
-// Backlight
+// Backlight pin
 static const int BL_PIN = 2;
 
-// Settings
-static uint32_t debounce_ms = 3;
-static uint8_t brightness = 220;
+// Settings (NVS)
+static uint32_t debounce_ms = 3;  // 1..50
+static uint8_t brightness  = 220; // 10..255
 
-// Safety
 static const bool ENABLE_WDT = true;
 // ==========================================================
 
-// ================== LVGL v8/v9 compatibility ==================
-#ifndef LVGL_VERSION_MAJOR
-  #define LVGL_VERSION_MAJOR 8
-#endif
-
-#if (LVGL_VERSION_MAJOR >= 9)
-  // LVGL v9 types
-  static lv_draw_buf_t draw_buf;
-#else
-  static lv_disp_draw_buf_t draw_buf;
-#endif
-
-static lv_color_t* lv_buf1 = nullptr;
-
-// =============== Display Driver ===============
+// =============== Display Driver (LovyanGFX RGB) ===============
 class LGFX : public lgfx::LGFX_Device {
 public:
   lgfx::Bus_RGB     bus;
@@ -68,6 +53,8 @@ public:
       cfg.memory_height = SCREEN_H;
       cfg.panel_width   = SCREEN_W;
       cfg.panel_height  = SCREEN_H;
+      cfg.offset_x = 0;
+      cfg.offset_y = 0;
       panel.config(cfg);
     }
     {
@@ -81,6 +68,7 @@ public:
       cfg.panel = &panel;
 
       if (DISPLAY_PRESET == 0) {
+        // PRESET A (رایج)
         cfg.pin_d0  = GPIO_NUM_15;
         cfg.pin_d1  = GPIO_NUM_7;
         cfg.pin_d2  = GPIO_NUM_6;
@@ -123,7 +111,7 @@ public:
 
     panel.setBus(&bus);
 
-    // Backlight pin type: use int (avoid lgfx::pin_t)
+    // Backlight: از int استفاده می‌کنیم (نه lgfx::pin_t)
     {
       auto cfg = light.config();
       cfg.pin_bl = BL_PIN;
@@ -131,11 +119,14 @@ public:
       panel.light(&light);
     }
 
-    // Touch
+    // Touch GT911
     {
       auto cfg = touch.config();
       cfg.x_min = 0; cfg.y_min = 0;
       cfg.x_max = SCREEN_W; cfg.y_max = SCREEN_H;
+
+      cfg.bus_shared = false;
+      cfg.offset_rotation = 0;
 
       cfg.i2c_port = I2C_NUM_0;
       cfg.pin_sda  = TOUCH_I2C_SDA;
@@ -154,7 +145,10 @@ public:
 
 static LGFX gfx;
 
-// =============== LVGL Callbacks ===============
+// =============== LVGL ===============
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t* lv_buf1 = nullptr;
+
 static void lv_flush_cb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
   int32_t w = area->x2 - area->x1 + 1;
   int32_t h = area->y2 - area->y1 + 1;
@@ -168,17 +162,19 @@ static void lv_flush_cb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* 
 }
 
 static void lv_touch_read_cb(lv_indev_drv_t* indev, lv_indev_data_t* data) {
+  (void) indev;
   uint16_t x, y;
   bool touched = gfx.getTouch(&x, &y);
-  if (!touched) data->state = LV_INDEV_STATE_RELEASED;
-  else {
+  if (!touched) {
+    data->state = LV_INDEV_STATE_RELEASED;
+  } else {
     data->state = LV_INDEV_STATE_PRESSED;
     data->point.x = x;
     data->point.y = y;
   }
 }
 
-// =============== App State ===============
+// =============== State Machine ===============
 enum class State : uint8_t { IDLE, RUNNING, DONE, STOPPED, ERROR };
 static State state = State::IDLE;
 
@@ -188,15 +184,15 @@ volatile uint32_t g_count = 0;
 volatile uint32_t g_last_ms = 0;
 static int target = 100;
 
-// UI objects
+// UI
 static lv_obj_t* label_status;
 static lv_obj_t* label_count;
 static lv_obj_t* label_target;
 static lv_obj_t* bar_progress;
+
 static lv_obj_t* ta_target;
 static lv_obj_t* kb;
 
-// Colors/Styles
 static lv_style_t st_btn_orange, st_btn_white, st_btn_red, st_card, st_title;
 
 static void motor_set(bool on) { digitalWrite(GPIO_MOTOR, on ? HIGH : LOW); }
@@ -226,9 +222,9 @@ static void save_settings() {
 }
 
 static void load_settings() {
-  target = prefs.getInt("target", 100);
+  target      = prefs.getInt("target", 100);
   debounce_ms = prefs.getUInt("deb", 3);
-  brightness = prefs.getUChar("bri", 220);
+  brightness  = prefs.getUChar("bri", 220);
 
   if (target < TARGET_MIN) target = TARGET_MIN;
   if (target > TARGET_MAX) target = TARGET_MAX;
@@ -245,13 +241,14 @@ static void ui_set_status(State s) {
 }
 
 static void ui_update_numbers() {
-  char a[64], b[64];
-  snprintf(a, sizeof(a), "IST: %lu", (unsigned long)g_count);
-  snprintf(b, sizeof(b), "ZIEL: %d", target);
-  lv_label_set_text(label_count, a);
-  lv_label_set_text(label_target, b);
+  char buf1[64], buf2[64];
+  snprintf(buf1, sizeof(buf1), "IST: %lu", (unsigned long)g_count);
+  snprintf(buf2, sizeof(buf2), "ZIEL: %d", target);
+  lv_label_set_text(label_count, buf1);
+  lv_label_set_text(label_target, buf2);
 
-  int pct = (target > 0) ? (int)((g_count * 100UL) / (uint32_t)target) : 0;
+  int pct = 0;
+  if (target > 0) pct = (int)((g_count * 100UL) / (uint32_t)target);
   if (pct > 100) pct = 100;
   lv_bar_set_value(bar_progress, pct, LV_ANIM_ON);
 }
@@ -261,6 +258,7 @@ static void start_run() {
   if (v < TARGET_MIN) v = TARGET_MIN;
   if (v > TARGET_MAX) v = TARGET_MAX;
   target = v;
+
   g_count = 0;
   motor_set(true);
   ui_set_status(State::RUNNING);
@@ -285,13 +283,30 @@ static void animate_button_press(lv_obj_t* btn) {
   lv_anim_start(&a);
 }
 
-static void btn_start_cb(lv_event_t* e) { (void)e; animate_button_press(lv_event_get_target(e)); if (state != State::RUNNING) start_run(); }
-static void btn_stop_cb (lv_event_t* e) { (void)e; animate_button_press(lv_event_get_target(e)); if (state == State::RUNNING) stop_run(State::STOPPED); }
-static void btn_reset_cb(lv_event_t* e) { (void)e; animate_button_press(lv_event_get_target(e)); motor_set(false); g_count = 0; ui_set_status(State::IDLE); ui_update_numbers(); }
+static void btn_start_cb(lv_event_t* e) {
+  lv_obj_t* btn = lv_event_get_target(e);
+  animate_button_press(btn);
+  if (state != State::RUNNING) start_run();
+}
+static void btn_stop_cb(lv_event_t* e) {
+  lv_obj_t* btn = lv_event_get_target(e);
+  animate_button_press(btn);
+  if (state == State::RUNNING) stop_run(State::STOPPED);
+}
+static void btn_reset_cb(lv_event_t* e) {
+  lv_obj_t* btn = lv_event_get_target(e);
+  animate_button_press(btn);
+  motor_set(false);
+  g_count = 0;
+  ui_set_status(State::IDLE);
+  ui_update_numbers();
+}
 
 static void kb_event_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
-  if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+  if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+    lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+  }
 }
 static void ta_event_cb(lv_event_t* e) {
   if (lv_event_get_code(e) == LV_EVENT_FOCUSED) {
@@ -300,31 +315,23 @@ static void ta_event_cb(lv_event_t* e) {
   }
 }
 
-static lv_obj_t* make_button(lv_obj_t* parent, const char* txt, lv_style_t* st, int w, int h) {
-  lv_obj_t* b = lv_btn_create(parent);
-  lv_obj_set_size(b, w, h);
-  lv_obj_add_style(b, st, 0);
-  lv_obj_t* l = lv_label_create(b);
-  lv_label_set_text(l, txt);
-  lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
-  lv_obj_center(l);
-  return b;
-}
-
 static void init_styles() {
-  lv_color_t C_ORANGE = lv_color_hex(0xFF7A00);
-  lv_color_t C_WHITE  = lv_color_hex(0xFFFFFF);
-  lv_color_t C_BG     = lv_color_hex(0xF3F4F6);
-  lv_color_t C_TEXT   = lv_color_hex(0x111827);
-  lv_color_t C_RED    = lv_color_hex(0xE11D48);
+  lv_color_t ORANGE = lv_color_hex(0xFF7A00);
+  lv_color_t WHITE  = lv_color_hex(0xFFFFFF);
+  lv_color_t BG     = lv_color_hex(0xF3F4F6);
+  lv_color_t TEXT   = lv_color_hex(0x111827);
+  lv_color_t RED    = lv_color_hex(0xE11D48);
+
+  lv_obj_set_style_bg_color(lv_scr_act(), BG, 0);
+  lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
 
   lv_style_init(&st_title);
   lv_style_set_text_font(&st_title, &lv_font_montserrat_28);
-  lv_style_set_text_color(&st_title, C_TEXT);
+  lv_style_set_text_color(&st_title, TEXT);
 
   lv_style_init(&st_card);
   lv_style_set_radius(&st_card, 18);
-  lv_style_set_bg_color(&st_card, C_WHITE);
+  lv_style_set_bg_color(&st_card, WHITE);
   lv_style_set_bg_opa(&st_card, LV_OPA_COVER);
   lv_style_set_pad_all(&st_card, 16);
   lv_style_set_shadow_width(&st_card, 24);
@@ -333,38 +340,48 @@ static void init_styles() {
 
   lv_style_init(&st_btn_orange);
   lv_style_set_radius(&st_btn_orange, 18);
-  lv_style_set_bg_color(&st_btn_orange, C_ORANGE);
+  lv_style_set_bg_color(&st_btn_orange, ORANGE);
   lv_style_set_bg_opa(&st_btn_orange, LV_OPA_COVER);
   lv_style_set_shadow_width(&st_btn_orange, 20);
-  lv_style_set_shadow_opa(&st_btn_orange, LV_OPA_20);
+  lv_style_set_shadow_opa(&st_btn_orange, LV_OPA_20); // جایگزین LV_OPA_25
   lv_style_set_shadow_ofs_y(&st_btn_orange, 6);
-  lv_style_set_text_color(&st_btn_orange, C_WHITE);
+  lv_style_set_text_color(&st_btn_orange, WHITE);
 
   lv_style_init(&st_btn_white);
   lv_style_set_radius(&st_btn_white, 18);
-  lv_style_set_bg_color(&st_btn_white, C_WHITE);
+  lv_style_set_bg_color(&st_btn_white, WHITE);
   lv_style_set_bg_opa(&st_btn_white, LV_OPA_COVER);
   lv_style_set_border_color(&st_btn_white, lv_color_hex(0xD1D5DB));
   lv_style_set_border_width(&st_btn_white, 2);
   lv_style_set_shadow_width(&st_btn_white, 14);
-  lv_style_set_shadow_opa(&st_btn_white, LV_OPA_10);
+  lv_style_set_shadow_opa(&st_btn_white, LV_OPA_10); // جایگزین LV_OPA_15
   lv_style_set_shadow_ofs_y(&st_btn_white, 4);
-  lv_style_set_text_color(&st_btn_white, C_TEXT);
+  lv_style_set_text_color(&st_btn_white, TEXT);
 
   lv_style_init(&st_btn_red);
   lv_style_set_radius(&st_btn_red, 18);
-  lv_style_set_bg_color(&st_btn_red, C_RED);
+  lv_style_set_bg_color(&st_btn_red, RED);
   lv_style_set_bg_opa(&st_btn_red, LV_OPA_COVER);
   lv_style_set_shadow_width(&st_btn_red, 20);
   lv_style_set_shadow_opa(&st_btn_red, LV_OPA_20);
   lv_style_set_shadow_ofs_y(&st_btn_red, 6);
-  lv_style_set_text_color(&st_btn_red, C_WHITE);
+  lv_style_set_text_color(&st_btn_red, WHITE);
+}
+
+static lv_obj_t* make_button(lv_obj_t* parent, const char* txt, lv_style_t* st, int w, int h) {
+  lv_obj_t* b = lv_btn_create(parent);
+  lv_obj_set_size(b, w, h);
+  lv_obj_add_style(b, st, 0);
+
+  lv_obj_t* l = lv_label_create(b);
+  lv_label_set_text(l, txt);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+  lv_obj_center(l);
+  return b;
 }
 
 static void create_ui() {
   lv_obj_t* scr = lv_scr_act();
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0xF3F4F6), 0);
-  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
   lv_obj_t* title = lv_label_create(scr);
   lv_obj_add_style(title, &st_title, 0);
@@ -446,24 +463,14 @@ static void init_lvgl() {
                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!lv_buf1) lv_buf1 = (lv_color_t*)malloc(SCREEN_W * LVGL_BUF_LINES * sizeof(lv_color_t));
 
-#if (LVGL_VERSION_MAJOR >= 9)
-  lv_draw_buf_init(&draw_buf, SCREEN_W, LVGL_BUF_LINES, LV_COLOR_FORMAT_RGB565, lv_buf1, SCREEN_W * LVGL_BUF_LINES * 2);
-#else
   lv_disp_draw_buf_init(&draw_buf, lv_buf1, nullptr, SCREEN_W * LVGL_BUF_LINES);
-#endif
 
   static lv_disp_drv_t disp_drv;
   lv_disp_drv_init(&disp_drv);
   disp_drv.hor_res = SCREEN_W;
   disp_drv.ver_res = SCREEN_H;
   disp_drv.flush_cb = lv_flush_cb;
-
-#if (LVGL_VERSION_MAJOR >= 9)
   disp_drv.draw_buf = &draw_buf;
-#else
-  disp_drv.draw_buf = &draw_buf;
-#endif
-
   lv_disp_drv_register(&disp_drv);
 
   static lv_indev_drv_t indev_drv;
@@ -504,8 +511,6 @@ void setup() {
   create_ui();
 
   wdt_setup();
-
-  Serial.println("[OK] Bandware Zaehler gestartet.");
 }
 
 void loop() {
