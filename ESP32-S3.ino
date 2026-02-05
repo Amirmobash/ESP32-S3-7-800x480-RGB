@@ -1,42 +1,44 @@
 #define LGFX_USE_V1
 #include <Arduino.h>
 #include <lvgl.h>
-#include <Preferences.h>
 
 #include <LovyanGFX.hpp>
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
-#include <Wire.h>
 
-/* =========================
-   CONFIG (easy to change)
-   ========================= */
+#include <Wire.h>
+#include <Preferences.h>
+
+// =====================================================
+// CONFIG (فقط اینجا را اگر لازم شد تغییر بده)
+// =====================================================
 static const int SCREEN_W = 800;
 static const int SCREEN_H = 480;
 
-/* Motor & Sensor GPIO */
-static const int GPIO_MOTOR  = 2;    // HIGH = Motor ON  (change if needed)
-static const int GPIO_SENSOR = 1;    // input from PC817 OUT (change if needed)
+// GPIOs پروژه
+static const int GPIO_SENSOR = 13;   // ورودی سنسور بعد از PC817 (LOW = پالس)
+static const int GPIO_MOTOR  = 12;   // خروجی کنترل موتور (HIGH=ON)
 
-/* Touch (GT911 typical) - اگر برد شما خودش تاچ را داخلی هندل می‌کند، این قسمت را می‌توان خاموش کرد */
-static const bool USE_GT911 = true;
-static const int TOUCH_I2C_SDA = 19;     // change if needed
-static const int TOUCH_I2C_SCL = 20;     // change if needed
-static const int TOUCH_RST_PIN = -1;     // -1 if not connected
-static const int TOUCH_INT_PIN = -1;     // -1 if not connected
-static const uint8_t GT911_ADDR = 0x5D;  // common 0x5D or 0x14
+// سنسور: debounce
+static volatile uint32_t g_lastPulseUs = 0;
+static volatile uint32_t g_count_isr   = 0;
+static uint32_t g_debounce_us = 3000; // 3ms (قابل تغییر از Settings)
 
-/* Debounce defaults */
-static const uint16_t DEBOUNCE_MS_DEFAULT = 3; // 2..10ms typical
+// هدف شمارش
+static uint32_t g_target = 100;
 
-/* LVGL draw buffer lines */
-static const int LVGL_BUF_LINES = 20;
+// تاچ GT911 (اگر برد شما فرق داشت این پین‌ها را عوض کن)
+static const int TOUCH_I2C_SDA = 17;
+static const int TOUCH_I2C_SCL = 18;
+static const int TOUCH_RST_PIN = -1;   // اگر نداری -1
+static const int TOUCH_INT_PIN = -1;   // اگر نداری -1
+static const uint8_t GT911_ADDR = 0x5D; // گاهی 0x14 است (اگر تاچ کار نکرد، 0x14 کن)
 
-/* =========================
-   LovyanGFX RGB (your working mapping)
-   ========================= */
+// =====================================================
+// LovyanGFX RGB (همان پین‌مپ شما)
+// =====================================================
 static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf1[SCREEN_W * LVGL_BUF_LINES];
+static lv_color_t buf1[SCREEN_W * 20];
 
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Bus_RGB bus;
@@ -104,16 +106,14 @@ public:
 
 static LGFX lcd;
 
-/* =========================
-   Touch (GT911 minimal)
-   ========================= */
+// =====================================================
+// GT911 minimal driver (بدون کتابخانه اضافه)
+// =====================================================
 struct TouchPoint {
-  bool pressed = false;
-  uint16_t x = 0;
-  uint16_t y = 0;
+  bool touched;
+  uint16_t x;
+  uint16_t y;
 };
-
-static TouchPoint g_touch;
 
 static bool i2c_read(uint8_t addr, uint16_t reg, uint8_t* data, size_t len) {
   Wire.beginTransmission(addr);
@@ -125,51 +125,76 @@ static bool i2c_read(uint8_t addr, uint16_t reg, uint8_t* data, size_t len) {
   return true;
 }
 
-static bool i2c_write(uint8_t addr, uint16_t reg, const uint8_t* data, size_t len) {
+static bool i2c_write8(uint8_t addr, uint16_t reg, uint8_t v) {
   Wire.beginTransmission(addr);
   Wire.write(reg & 0xFF);
   Wire.write((reg >> 8) & 0xFF);
-  for (size_t i = 0; i < len; i++) Wire.write(data[i]);
+  Wire.write(v);
   return Wire.endTransmission() == 0;
 }
 
-static bool gt911_read_point(TouchPoint &tp) {
-  // GT911 status reg 0x814E, points start 0x8150 (little-endian regs)
+static bool gt911_begin() {
+  Wire.begin(TOUCH_I2C_SDA, TOUCH_I2C_SCL, 400000);
+
+  // optional reset
+  if (TOUCH_RST_PIN >= 0) {
+    pinMode(TOUCH_RST_PIN, OUTPUT);
+    digitalWrite(TOUCH_RST_PIN, 0);
+    delay(10);
+    digitalWrite(TOUCH_RST_PIN, 1);
+    delay(50);
+  }
+  if (TOUCH_INT_PIN >= 0) {
+    pinMode(TOUCH_INT_PIN, INPUT_PULLUP);
+  }
+
+  // check product id
+  uint8_t id[4] = {0};
+  if (!i2c_read(GT911_ADDR, 0x8140, id, 4)) return false;
+
+  Serial.printf("GT911 ID: %c%c%c%c\n", id[0], id[1], id[2], id[3]);
+  return true;
+}
+
+static TouchPoint gt911_read() {
+  TouchPoint p{false, 0, 0};
+
   uint8_t status = 0;
-  if (!i2c_read(GT911_ADDR, 0x814E, &status, 1)) return false;
+  if (!i2c_read(GT911_ADDR, 0x814E, &status, 1)) return p;
 
   uint8_t n = status & 0x0F;
   if ((status & 0x80) == 0 || n == 0) {
-    tp.pressed = false;
-    // clear status
-    uint8_t z = 0;
-    i2c_write(GT911_ADDR, 0x814E, &z, 1);
-    return true;
+    // clear if needed
+    i2c_write8(GT911_ADDR, 0x814E, 0x00);
+    return p;
   }
 
-  uint8_t buf[8] = {0};
-  if (!i2c_read(GT911_ADDR, 0x8150, buf, 8)) return false;
+  // first point at 0x8150 (8 bytes per point)
+  uint8_t buf[8];
+  if (!i2c_read(GT911_ADDR, 0x8150, buf, 8)) {
+    i2c_write8(GT911_ADDR, 0x814E, 0x00);
+    return p;
+  }
 
   uint16_t x = (uint16_t)buf[1] << 8 | buf[0];
   uint16_t y = (uint16_t)buf[3] << 8 | buf[2];
 
-  // clear status
-  uint8_t z = 0;
-  i2c_write(GT911_ADDR, 0x814E, &z, 1);
+  // clear "data ready"
+  i2c_write8(GT911_ADDR, 0x814E, 0x00);
 
   // clamp
   if (x >= SCREEN_W) x = SCREEN_W - 1;
   if (y >= SCREEN_H) y = SCREEN_H - 1;
 
-  tp.pressed = true;
-  tp.x = x;
-  tp.y = y;
-  return true;
+  p.touched = true;
+  p.x = x;
+  p.y = y;
+  return p;
 }
 
-/* =========================
-   LVGL callbacks
-   ========================= */
+// =====================================================
+// LVGL glue
+// =====================================================
 static void flush_cb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
   uint32_t w = area->x2 - area->x1 + 1;
   uint32_t h = area->y2 - area->y1 + 1;
@@ -182,47 +207,29 @@ static void flush_cb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* col
   lv_disp_flush_ready(disp);
 }
 
-static void touch_read_cb(lv_indev_drv_t* indev, lv_indev_data_t* data) {
+static void touch_cb(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   (void)indev;
-  if (USE_GT911) {
-    TouchPoint tp;
-    if (gt911_read_point(tp)) g_touch = tp;
+  TouchPoint p = gt911_read();
+
+  if (!p.touched) {
+    data->state = LV_INDEV_STATE_REL;
+    return;
   }
-  data->state = g_touch.pressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
-  data->point.x = g_touch.x;
-  data->point.y = g_touch.y;
+  data->state = LV_INDEV_STATE_PR;
+  data->point.x = p.x;
+  data->point.y = p.y;
 }
 
-/* =========================
-   Machine logic
-   ========================= */
+// =====================================================
+// App logic
+// =====================================================
 enum class State : uint8_t { IDLE, RUNNING, DONE, STOPPED, ERROR };
-
-static volatile uint32_t g_count_isr = 0;
-static volatile uint32_t g_last_isr_us = 0;
-
-static uint32_t g_count = 0;
-static uint16_t g_target = 100;
-static uint16_t g_debounce_ms = DEBOUNCE_MS_DEFAULT;
 static State g_state = State::IDLE;
 
 static Preferences prefs;
 
-static void motor_set(bool on) {
-  digitalWrite(GPIO_MOTOR, on ? HIGH : LOW);
-}
-
-static IRAM_ATTR void sensor_isr() {
-  uint32_t now = (uint32_t)micros();
-  uint32_t min_us = (uint32_t)g_debounce_ms * 1000UL;
-  if (now - g_last_isr_us < min_us) return;
-  g_last_isr_us = now;
-  g_count_isr++;
-}
-
-/* =========================
-   UI (German + Orange/White)
-   ========================= */
+// UI objects
+static lv_obj_t* label_title;
 static lv_obj_t* label_status;
 static lv_obj_t* label_count;
 static lv_obj_t* label_target;
@@ -231,12 +238,23 @@ static lv_obj_t* btn_start;
 static lv_obj_t* btn_stop;
 static lv_obj_t* btn_reset;
 static lv_obj_t* btn_target;
-static lv_obj_t* panel_settings;
-static lv_obj_t* slider_deb;
+static lv_obj_t* panel_keypad = nullptr;
+static lv_obj_t* panel_settings = nullptr;
+static lv_obj_t* slider_debounce = nullptr;
 
-static lv_style_t st_bg, st_title, st_status, st_big, st_mid, st_btn_orange, st_btn_white, st_btn_stop;
+static lv_style_t st_bg;
+static lv_style_t st_orange_btn;
+static lv_style_t st_white_btn;
+static lv_style_t st_red_btn;
+static lv_style_t st_text_big;
+static lv_style_t st_text_mid;
+static lv_style_t st_status;
 
-static lv_color_t ORANGE = lv_color_hex(0xFF7A00);
+static inline uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
 
 static const char* state_text(State s) {
   switch (s) {
@@ -249,134 +267,39 @@ static const char* state_text(State s) {
   }
 }
 
+static void motor_set(bool on) {
+  digitalWrite(GPIO_MOTOR, on ? HIGH : LOW);
+}
+
+static void ui_update_numbers() {
+  uint32_t c = g_count_isr;
+  char buf[64];
+
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)c);
+  lv_label_set_text(label_count, buf);
+
+  snprintf(buf, sizeof(buf), "Ziel: %lu", (unsigned long)g_target);
+  lv_label_set_text(label_target, buf);
+
+  uint32_t pct = (g_target == 0) ? 0 : (uint32_t)((c * 100UL) / g_target);
+  pct = clamp_u32(pct, 0, 100);
+  lv_bar_set_value(bar_progress, (int)pct, LV_ANIM_ON);
+}
+
 static void ui_set_status(State s) {
   g_state = s;
   lv_label_set_text(label_status, state_text(s));
 
-  // fade-in animation for status
-  lv_obj_set_style_opa(label_status, LV_OPA_0, 0);
-  lv_anim_t a;
-  lv_anim_init(&a);
-  lv_anim_set_var(&a, label_status);
-  lv_anim_set_values(&a, 0, 255);
-  lv_anim_set_time(&a, 220);
-  lv_anim_set_exec_cb(&a, [](void* obj, int32_t v){
-    lv_obj_set_style_opa((lv_obj_t*)obj, (lv_opa_t)v, 0);
-  });
-  lv_anim_start(&a);
-}
-
-static void ui_update_numbers() {
-  static char buf[64];
-
-  snprintf(buf, sizeof(buf), "%lu", (unsigned long)g_count);
-  lv_label_set_text(label_count, buf);
-
-  snprintf(buf, sizeof(buf), "Ziel: %u", (unsigned)g_target);
-  lv_label_set_text(label_target, buf);
-
-  int32_t pct = 0;
-  if (g_target > 0) pct = (int32_t)((g_count * 100UL) / g_target);
-  if (pct < 0) pct = 0;
-  if (pct > 100) pct = 100;
-
-  lv_bar_set_value(bar_progress, pct, LV_ANIM_ON);
-}
-
-static void animate_button(lv_obj_t* btn) {
-  // small "press" scale illusion by padding animation
-  lv_anim_t a;
-  lv_anim_init(&a);
-  lv_anim_set_var(&a, btn);
-  lv_anim_set_values(&a, 12, 6);
-  lv_anim_set_time(&a, 90);
-  lv_anim_set_playback_time(&a, 90);
-  lv_anim_set_exec_cb(&a, [](void* obj, int32_t v){
-    lv_obj_set_style_pad_all((lv_obj_t*)obj, v, 0);
-  });
-  lv_anim_start(&a);
-}
-
-/* ---------- Numeric keypad (BtnMatrix) ---------- */
-static lv_obj_t* kb_win = nullptr;
-static lv_obj_t* kb_label = nullptr;
-
-static const char* kb_map[] = {
-  "1","2","3","\n",
-  "4","5","6","\n",
-  "7","8","9","\n",
-  "C","0","OK",""
-};
-
-static void kb_close() {
-  if (kb_win) {
-    lv_obj_del(kb_win);
-    kb_win = nullptr;
-    kb_label = nullptr;
-  }
-}
-
-static void kb_event_cb(lv_event_t* e) {
-  lv_obj_t* m = lv_event_get_target(e);
-  uint32_t id = lv_btnmatrix_get_selected_btn(m);
-  const char* txt = lv_btnmatrix_get_btn_text(m, id);
-  if (!txt) return;
-
-  static char inbuf[8] = "100";
-
-  if (strcmp(txt, "C") == 0) {
-    strcpy(inbuf, "");
-  } else if (strcmp(txt, "OK") == 0) {
-    int v = atoi(inbuf);
-    if (v < 1) v = 1;
-    if (v > 1000) v = 1000;
-    g_target = (uint16_t)v;
-    prefs.putUShort("target", g_target);
-    ui_update_numbers();
-    kb_close();
-    return;
+  // color hint
+  if (s == State::RUNNING) {
+    lv_obj_set_style_text_color(label_status, lv_color_hex(0xFF7A00), 0);
+  } else if (s == State::DONE) {
+    lv_obj_set_style_text_color(label_status, lv_color_hex(0x2E7D32), 0);
+  } else if (s == State::ERROR) {
+    lv_obj_set_style_text_color(label_status, lv_color_hex(0xC62828), 0);
   } else {
-    // digit
-    if (strlen(inbuf) < 4) {
-      size_t L = strlen(inbuf);
-      inbuf[L] = txt[0];
-      inbuf[L+1] = 0;
-    }
+    lv_obj_set_style_text_color(label_status, lv_color_hex(0x333333), 0);
   }
-  if (kb_label) lv_label_set_text(kb_label, inbuf);
-}
-
-static void open_keypad() {
-  if (kb_win) return;
-
-  kb_win = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(kb_win, 420, 360);
-  lv_obj_center(kb_win);
-  lv_obj_set_style_radius(kb_win, 16, 0);
-  lv_obj_set_style_pad_all(kb_win, 14, 0);
-
-  lv_obj_t* title = lv_label_create(kb_win);
-  lv_label_set_text(title, "Zielmenge eingeben (1..1000)");
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
-
-  kb_label = lv_label_create(kb_win);
-  lv_label_set_text(kb_label, "100");
-  lv_obj_set_style_text_font(kb_label, &lv_font_montserrat_36, 0);
-  lv_obj_align(kb_label, LV_ALIGN_TOP_MID, 0, 34);
-
-  lv_obj_t* m = lv_btnmatrix_create(kb_win);
-  lv_btnmatrix_set_map(m, kb_map);
-  lv_obj_set_size(m, 380, 240);
-  lv_obj_align(m, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_obj_add_event_cb(m, kb_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
-}
-
-static void start_run() {
-  g_count = 0;
-  g_count_isr = 0;
-  motor_set(true);
-  ui_set_status(State::RUNNING);
-  ui_update_numbers();
 }
 
 static void stop_run(State next) {
@@ -384,102 +307,298 @@ static void stop_run(State next) {
   ui_set_status(next);
 }
 
+static void start_run() {
+  g_count_isr = 0;
+  ui_update_numbers();
+  motor_set(true);
+  ui_set_status(State::RUNNING);
+}
+
+static void animate_button_press(lv_obj_t* btn) {
+  if (!btn) return;
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, btn);
+  lv_anim_set_time(&a, 90);
+  lv_anim_set_values(&a, 100, 96);
+  lv_anim_set_exec_cb(&a, [](void* v, int32_t val) {
+    lv_obj_t* o = (lv_obj_t*)v;
+    lv_obj_set_style_transform_zoom(o, (int16_t)val, 0);
+  });
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+  lv_anim_start(&a);
+
+  lv_anim_t b;
+  lv_anim_init(&b);
+  lv_anim_set_var(&b, btn);
+  lv_anim_set_time(&b, 120);
+  lv_anim_set_delay(&b, 90);
+  lv_anim_set_values(&b, 96, 100);
+  lv_anim_set_exec_cb(&b, [](void* v, int32_t val) {
+    lv_obj_t* o = (lv_obj_t*)v;
+    lv_obj_set_style_transform_zoom(o, (int16_t)val, 0);
+  });
+  lv_anim_set_path_cb(&b, lv_anim_path_ease_in);
+  lv_anim_start(&b);
+}
+
+static void keypad_close() {
+  if (panel_keypad) {
+    lv_obj_del(panel_keypad);
+    panel_keypad = nullptr;
+  }
+}
+
+static void keypad_apply_text(const char* txt) {
+  uint32_t v = (uint32_t)atoi(txt);
+  v = clamp_u32(v, 1, 1000);
+  g_target = v;
+  prefs.putUInt("target", g_target);
+  ui_update_numbers();
+}
+
+static void keypad_btn_cb(lv_event_t* e) {
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  const char* t = lv_label_get_text(lv_obj_get_child(btn, 0));
+
+  static char inbuf[8] = {0}; // up to 1000
+  size_t len = strlen(inbuf);
+
+  if (!strcmp(t, "OK")) {
+    if (len == 0) strcpy(inbuf, "1");
+    keypad_apply_text(inbuf);
+    inbuf[0] = 0;
+    keypad_close();
+    return;
+  }
+  if (!strcmp(t, "C")) {
+    inbuf[0] = 0;
+  } else if (!strcmp(t, "<")) {
+    if (len > 0) inbuf[len - 1] = 0;
+  } else {
+    if (len < sizeof(inbuf) - 1) {
+      inbuf[len] = t[0];
+      inbuf[len + 1] = 0;
+    }
+  }
+
+  // update display
+  lv_obj_t* lbl = lv_obj_get_child(panel_keypad, 0);
+  char shown[32];
+  snprintf(shown, sizeof(shown), "Zielmenge: %s", (strlen(inbuf) ? inbuf : "_"));
+  lv_label_set_text(lbl, shown);
+}
+
+static lv_obj_t* make_kbtn(lv_obj_t* parent, const char* txt) {
+  lv_obj_t* b = lv_btn_create(parent);
+  lv_obj_set_size(b, 90, 70);
+  lv_obj_add_event_cb(b, keypad_btn_cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t* l = lv_label_create(b);
+  lv_label_set_text(l, txt);
+  lv_obj_center(l);
+
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_28, 0);
+  return b;
+}
+
+static void open_keypad() {
+  keypad_close();
+
+  panel_keypad = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(panel_keypad, 520, 360);
+  lv_obj_center(panel_keypad);
+  lv_obj_set_style_radius(panel_keypad, 18, 0);
+  lv_obj_set_style_bg_color(panel_keypad, lv_color_white(), 0);
+  lv_obj_set_style_pad_all(panel_keypad, 14, 0);
+  lv_obj_set_style_shadow_width(panel_keypad, 22, 0);
+  lv_obj_set_style_shadow_opa(panel_keypad, LV_OPA_30, 0);
+
+  lv_obj_t* top = lv_label_create(panel_keypad);
+  lv_label_set_text(top, "Zielmenge: _");
+  lv_obj_set_style_text_font(top, &lv_font_montserrat_28, 0);
+  lv_obj_align(top, LV_ALIGN_TOP_MID, 0, 0);
+
+  lv_obj_t* grid = lv_obj_create(panel_keypad);
+  lv_obj_set_size(grid, 500, 280);
+  lv_obj_align(grid, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_bg_opa(grid, LV_OPA_0, 0);
+  lv_obj_set_style_border_width(grid, 0, 0);
+  lv_obj_set_style_pad_all(grid, 6, 0);
+
+  static lv_coord_t col[] = {100,100,100,100, LV_GRID_TEMPLATE_LAST};
+  static lv_coord_t row[] = {80,80,80,80, LV_GRID_TEMPLATE_LAST};
+  lv_obj_set_grid_dsc_array(grid, col, row);
+
+  const char* keys[16] = {
+    "1","2","3","<",
+    "4","5","6","C",
+    "7","8","9","OK",
+    "0","","",""
+  };
+
+  for (int i = 0; i < 16; i++) {
+    if (keys[i][0] == 0) continue;
+    lv_obj_t* b = make_kbtn(grid, keys[i]);
+    lv_obj_set_grid_cell(b, LV_GRID_ALIGN_CENTER, i % 4, 1, LV_GRID_ALIGN_CENTER, i / 4, 1);
+  }
+}
+
+static void settings_close() {
+  if (panel_settings) {
+    lv_obj_del(panel_settings);
+    panel_settings = nullptr;
+  }
+}
+
+static void slider_cb(lv_event_t* e) {
+  lv_obj_t* sl = (lv_obj_t*)lv_event_get_target(e);
+  int v = lv_slider_get_value(sl);
+  g_debounce_us = (uint32_t)v * 1000UL;
+  prefs.putUInt("deb_ms", (uint32_t)v);
+
+  // update small label
+  lv_obj_t* lbl = (lv_obj_t*)lv_event_get_user_data(e);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "Entprellung: %d ms", v);
+  lv_label_set_text(lbl, buf);
+}
+
+static void open_settings() {
+  settings_close();
+
+  panel_settings = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(panel_settings, 520, 240);
+  lv_obj_center(panel_settings);
+  lv_obj_set_style_radius(panel_settings, 18, 0);
+  lv_obj_set_style_bg_color(panel_settings, lv_color_white(), 0);
+  lv_obj_set_style_pad_all(panel_settings, 16, 0);
+  lv_obj_set_style_shadow_width(panel_settings, 22, 0);
+  lv_obj_set_style_shadow_opa(panel_settings, LV_OPA_30, 0);
+
+  lv_obj_t* t = lv_label_create(panel_settings);
+  lv_label_set_text(t, "Einstellungen");
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_28, 0);
+  lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 0);
+
+  uint32_t deb_ms = prefs.getUInt("deb_ms", 3);
+  deb_ms = clamp_u32(deb_ms, 1, 20);
+
+  lv_obj_t* lbl = lv_label_create(panel_settings);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "Entprellung: %lu ms", (unsigned long)deb_ms);
+  lv_label_set_text(lbl, buf);
+  lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+  lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 60);
+
+  slider_debounce = lv_slider_create(panel_settings);
+  lv_obj_set_width(slider_debounce, 480);
+  lv_obj_align(slider_debounce, LV_ALIGN_TOP_LEFT, 0, 95);
+  lv_slider_set_range(slider_debounce, 1, 20);
+  lv_slider_set_value(slider_debounce, (int)deb_ms, LV_ANIM_OFF);
+  lv_obj_add_event_cb(slider_debounce, slider_cb, LV_EVENT_VALUE_CHANGED, lbl);
+
+  lv_obj_t* closeb = lv_btn_create(panel_settings);
+  lv_obj_set_size(closeb, 150, 55);
+  lv_obj_align(closeb, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+  lv_obj_add_event_cb(closeb, [](lv_event_t* e){
+    (void)e;
+    settings_close();
+  }, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t* cl = lv_label_create(closeb);
+  lv_label_set_text(cl, "OK");
+  lv_obj_set_style_text_font(cl, &lv_font_montserrat_28, 0);
+  lv_obj_center(cl);
+}
+
+// Button callbacks
 static void btn_start_cb(lv_event_t* e) {
-  (void)e;
-  animate_button(btn_start);
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_button_press(btn);
   if (g_state != State::RUNNING) start_run();
 }
 
 static void btn_stop_cb(lv_event_t* e) {
-  (void)e;
-  animate_button(btn_stop);
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_button_press(btn);
   if (g_state == State::RUNNING) stop_run(State::STOPPED);
 }
 
 static void btn_reset_cb(lv_event_t* e) {
-  (void)e;
-  animate_button(btn_reset);
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_button_press(btn);
   motor_set(false);
-  g_count = 0;
   g_count_isr = 0;
   ui_set_status(State::IDLE);
   ui_update_numbers();
 }
 
 static void btn_target_cb(lv_event_t* e) {
-  (void)e;
-  animate_button(btn_target);
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_button_press(btn);
   open_keypad();
 }
 
-static void slider_event_cb(lv_event_t* e) {
-  lv_obj_t* s = lv_event_get_target(e);
-  int v = lv_slider_get_value(s);
-  if (v < 2) v = 2;
-  if (v > 10) v = 10;
-  g_debounce_ms = (uint16_t)v;
-  prefs.putUShort("deb", g_debounce_ms);
+static void btn_settings_cb(lv_event_t* e) {
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_button_press(btn);
+  open_settings();
 }
 
+// Styles + UI
 static void init_styles() {
   lv_style_init(&st_bg);
-  lv_style_set_bg_color(&st_bg, lv_color_hex(0xF6F6F6));
+  lv_style_set_bg_color(&st_bg, lv_color_hex(0xF3F4F6));
   lv_style_set_bg_opa(&st_bg, LV_OPA_COVER);
 
-  lv_style_init(&st_title);
-  lv_style_set_text_font(&st_title, &lv_font_montserrat_28);
-  lv_style_set_text_color(&st_title, lv_color_hex(0x222222));
+  lv_style_init(&st_orange_btn);
+  lv_style_set_bg_color(&st_orange_btn, lv_color_hex(0xFF7A00));
+  lv_style_set_bg_opa(&st_orange_btn, LV_OPA_COVER);
+  lv_style_set_radius(&st_orange_btn, 16);
+  lv_style_set_shadow_width(&st_orange_btn, 16);
+  lv_style_set_shadow_opa(&st_orange_btn, LV_OPA_30);
+  lv_style_set_shadow_ofs_y(&st_orange_btn, 6);
+
+  lv_style_init(&st_white_btn);
+  lv_style_set_bg_color(&st_white_btn, lv_color_white());
+  lv_style_set_bg_opa(&st_white_btn, LV_OPA_COVER);
+  lv_style_set_border_color(&st_white_btn, lv_color_hex(0xD0D5DD));
+  lv_style_set_border_width(&st_white_btn, 2);
+  lv_style_set_radius(&st_white_btn, 16);
+
+  lv_style_init(&st_red_btn);
+  lv_style_set_bg_color(&st_red_btn, lv_color_hex(0xD32F2F));
+  lv_style_set_bg_opa(&st_red_btn, LV_OPA_COVER);
+  lv_style_set_radius(&st_red_btn, 16);
+  lv_style_set_shadow_width(&st_red_btn, 16);
+  lv_style_set_shadow_opa(&st_red_btn, LV_OPA_25);
+  lv_style_set_shadow_ofs_y(&st_red_btn, 6);
+
+  lv_style_init(&st_text_big);
+  lv_style_set_text_font(&st_text_big, &lv_font_montserrat_28);
+  lv_style_set_text_color(&st_text_big, lv_color_hex(0x111827));
+
+  lv_style_init(&st_text_mid);
+  lv_style_set_text_font(&st_text_mid, &lv_font_montserrat_16);
+  lv_style_set_text_color(&st_text_mid, lv_color_hex(0x374151));
 
   lv_style_init(&st_status);
-  lv_style_set_text_font(&st_status, &lv_font_montserrat_18);
-  lv_style_set_text_color(&st_status, lv_color_hex(0x444444));
-
-  lv_style_init(&st_big);
-  lv_style_set_text_font(&st_big, &lv_font_montserrat_48);
-  lv_style_set_text_color(&st_big, lv_color_hex(0x111111));
-
-  lv_style_init(&st_mid);
-  lv_style_set_text_font(&st_mid, &lv_font_montserrat_22);
-  lv_style_set_text_color(&st_mid, lv_color_hex(0x333333));
-
-  // Orange button
-  lv_style_init(&st_btn_orange);
-  lv_style_set_bg_color(&st_btn_orange, ORANGE);
-  lv_style_set_bg_opa(&st_btn_orange, LV_OPA_COVER);
-  lv_style_set_radius(&st_btn_orange, 18);
-  lv_style_set_shadow_width(&st_btn_orange, 20);
-  lv_style_set_shadow_opa(&st_btn_orange, LV_OPA_20);
-
-  // White button
-  lv_style_init(&st_btn_white);
-  lv_style_set_bg_color(&st_btn_white, lv_color_hex(0xFFFFFF));
-  lv_style_set_bg_opa(&st_btn_white, LV_OPA_COVER);
-  lv_style_set_radius(&st_btn_white, 18);
-  lv_style_set_border_width(&st_btn_white, 2);
-  lv_style_set_border_color(&st_btn_white, lv_color_hex(0xDDDDDD));
-  lv_style_set_shadow_width(&st_btn_white, 16);
-  lv_style_set_shadow_opa(&st_btn_white, LV_OPA_10);
-
-  // Stop (red-ish)
-  lv_style_init(&st_btn_stop);
-  lv_style_set_bg_color(&st_btn_stop, lv_color_hex(0xFFFFFF));
-  lv_style_set_bg_opa(&st_btn_stop, LV_OPA_COVER);
-  lv_style_set_radius(&st_btn_stop, 18);
-  lv_style_set_border_width(&st_btn_stop, 3);
-  lv_style_set_border_color(&st_btn_stop, lv_color_hex(0xD03030));
+  lv_style_set_text_font(&st_status, &lv_font_montserrat_16);
+  lv_style_set_text_color(&st_status, lv_color_hex(0x333333));
 }
 
-static lv_obj_t* make_btn(lv_obj_t* parent, const char* text, lv_style_t* st, lv_event_cb_t cb) {
+static lv_obj_t* make_btn(lv_obj_t* parent, const char* txt, lv_style_t* st, lv_event_cb_t cb) {
   lv_obj_t* b = lv_btn_create(parent);
   lv_obj_add_style(b, st, 0);
+  lv_obj_set_size(b, 220, 80);
   lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_set_style_pad_all(b, 12, 0);
 
-  lv_obj_t* t = lv_label_create(b);
-  lv_label_set_text(t, text);
-  lv_obj_center(t);
-  lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
-  lv_obj_set_style_text_color(t, lv_color_hex(0x111111), 0);
+  lv_obj_t* l = lv_label_create(b);
+  lv_label_set_text(l, txt);
+  lv_obj_center(l);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(l, lv_color_white(), 0);
   return b;
 }
 
@@ -487,89 +606,120 @@ static void build_ui() {
   lv_obj_t* scr = lv_scr_act();
   lv_obj_add_style(scr, &st_bg, 0);
 
-  // Title
-  lv_obj_t* title = lv_label_create(scr);
-  lv_label_set_text(title, "Bandware Zähler");
-  lv_obj_add_style(title, &st_title, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 24, 16);
+  // title
+  label_title = lv_label_create(scr);
+  lv_label_set_text(label_title, "Bandware Zähler");
+  lv_obj_add_style(label_title, &st_text_big, 0);
+  lv_obj_align(label_title, LV_ALIGN_TOP_LEFT, 20, 16);
 
-  // Status
+  // status
   label_status = lv_label_create(scr);
   lv_label_set_text(label_status, "Bereit");
   lv_obj_add_style(label_status, &st_status, 0);
-  lv_obj_align(label_status, LV_ALIGN_TOP_LEFT, 24, 56);
+  lv_obj_align(label_status, LV_ALIGN_TOP_LEFT, 20, 56);
 
-  // Count big
+  // big counter
   label_count = lv_label_create(scr);
   lv_label_set_text(label_count, "0");
-  lv_obj_add_style(label_count, &st_big, 0);
-  lv_obj_align(label_count, LV_ALIGN_LEFT_MID, 40, -60);
+  lv_obj_set_style_text_font(label_count, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(label_count, lv_color_hex(0x111827), 0);
+  lv_obj_align(label_count, LV_ALIGN_LEFT_MID, 40, -40);
 
-  // Target label
+  // target label
   label_target = lv_label_create(scr);
   lv_label_set_text(label_target, "Ziel: 100");
-  lv_obj_add_style(label_target, &st_mid, 0);
-  lv_obj_align(label_target, LV_ALIGN_LEFT_MID, 44, 10);
+  lv_obj_add_style(label_target, &st_text_mid, 0);
+  lv_obj_align(label_target, LV_ALIGN_LEFT_MID, 40, 0);
 
-  // Target button
-  btn_target = make_btn(scr, "Zielmenge", &st_btn_white, btn_target_cb);
-  lv_obj_set_size(btn_target, 210, 70);
-  lv_obj_align(btn_target, LV_ALIGN_LEFT_MID, 40, 80);
-
-  // Progress
+  // progress
   bar_progress = lv_bar_create(scr);
-  lv_obj_set_size(bar_progress, 720, 18);
-  lv_obj_align(bar_progress, LV_ALIGN_BOTTOM_MID, 0, -24);
+  lv_obj_set_size(bar_progress, 520, 26);
+  lv_obj_align(bar_progress, LV_ALIGN_LEFT_MID, 40, 50);
   lv_bar_set_range(bar_progress, 0, 100);
   lv_bar_set_value(bar_progress, 0, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(bar_progress, lv_color_hex(0xEAEAEA), 0);
-  lv_obj_set_style_bg_color(bar_progress, ORANGE, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(bar_progress, lv_color_hex(0xE5E7EB), 0);
+  lv_obj_set_style_bg_color(bar_progress, lv_color_hex(0xFF7A00), LV_PART_INDICATOR);
 
-  // Buttons right
-  btn_start = make_btn(scr, "START", &st_btn_orange, btn_start_cb);
-  lv_obj_set_size(btn_start, 240, 90);
-  lv_obj_align(btn_start, LV_ALIGN_RIGHT_MID, -40, -80);
+  // buttons (right side)
+  btn_start = make_btn(scr, "START", &st_orange_btn, btn_start_cb);
+  lv_obj_align(btn_start, LV_ALIGN_RIGHT_MID, -30, -100);
 
-  btn_stop = make_btn(scr, "STOP", &st_btn_stop, btn_stop_cb);
-  lv_obj_set_size(btn_stop, 240, 90);
-  lv_obj_align(btn_stop, LV_ALIGN_RIGHT_MID, -40, 20);
+  btn_stop = make_btn(scr, "STOP", &st_red_btn, btn_stop_cb);
+  lv_obj_align(btn_stop, LV_ALIGN_RIGHT_MID, -30, 0);
 
-  btn_reset = make_btn(scr, "RESET", &st_btn_white, btn_reset_cb);
-  lv_obj_set_size(btn_reset, 240, 90);
-  lv_obj_align(btn_reset, LV_ALIGN_RIGHT_MID, -40, 120);
+  btn_reset = make_btn(scr, "RESET", &st_white_btn, btn_reset_cb);
+  lv_obj_align(btn_reset, LV_ALIGN_RIGHT_MID, -30, 100);
+  // reset text black
+  lv_obj_t* rlbl = lv_obj_get_child(btn_reset, 0);
+  lv_obj_set_style_text_color(rlbl, lv_color_hex(0x111827), 0);
 
-  // Settings small panel (debounce)
-  panel_settings = lv_obj_create(scr);
-  lv_obj_set_size(panel_settings, 300, 80);
-  lv_obj_align(panel_settings, LV_ALIGN_TOP_RIGHT, -24, 14);
-  lv_obj_set_style_radius(panel_settings, 16, 0);
-  lv_obj_set_style_bg_color(panel_settings, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_style_shadow_width(panel_settings, 14, 0);
-  lv_obj_set_style_shadow_opa(panel_settings, LV_OPA_10, 0);
-  lv_obj_set_style_pad_all(panel_settings, 12, 0);
+  // target button (bottom left)
+  btn_target = lv_btn_create(scr);
+  lv_obj_add_style(btn_target, &st_white_btn, 0);
+  lv_obj_set_size(btn_target, 240, 60);
+  lv_obj_align(btn_target, LV_ALIGN_BOTTOM_LEFT, 20, -20);
+  lv_obj_add_event_cb(btn_target, btn_target_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* tt = lv_label_create(btn_target);
+  lv_label_set_text(tt, "Zielmenge");
+  lv_obj_set_style_text_font(tt, &lv_font_montserrat_16, 0);
+  lv_obj_center(tt);
 
-  lv_obj_t* s_title = lv_label_create(panel_settings);
-  lv_label_set_text(s_title, "Entprellung (ms)");
-  lv_obj_set_style_text_font(s_title, &lv_font_montserrat_18, 0);
-  lv_obj_align(s_title, LV_ALIGN_TOP_LEFT, 0, 0);
+  // settings button
+  lv_obj_t* btn_set = lv_btn_create(scr);
+  lv_obj_add_style(btn_set, &st_white_btn, 0);
+  lv_obj_set_size(btn_set, 240, 60);
+  lv_obj_align(btn_set, LV_ALIGN_BOTTOM_LEFT, 280, -20);
+  lv_obj_add_event_cb(btn_set, btn_settings_cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* st = lv_label_create(btn_set);
+  lv_label_set_text(st, "Einstellungen");
+  lv_obj_set_style_text_font(st, &lv_font_montserrat_16, 0);
+  lv_obj_center(st);
 
-  slider_deb = lv_slider_create(panel_settings);
-  lv_obj_set_size(slider_deb, 260, 16);
-  lv_obj_align(slider_deb, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-  lv_slider_set_range(slider_deb, 2, 10);
-  lv_slider_set_value(slider_deb, g_debounce_ms, LV_ANIM_OFF);
-  lv_obj_add_event_cb(slider_deb, slider_event_cb, LV_EVENT_VALUE_CHANGED, nullptr);
-  lv_obj_set_style_bg_color(slider_deb, lv_color_hex(0xEAEAEA), 0);
-  lv_obj_set_style_bg_color(slider_deb, ORANGE, LV_PART_INDICATOR);
+  ui_update_numbers();
+  ui_set_status(State::IDLE);
 }
 
-/* =========================
-   Setup / Loop
-   ========================= */
-static void init_lvgl() {
-  lv_init();
+// =====================================================
+// ISR sensor
+// =====================================================
+static void IRAM_ATTR sensor_isr() {
+  uint32_t now = (uint32_t)micros();
+  if (now - g_lastPulseUs < g_debounce_us) return;
+  g_lastPulseUs = now;
+  g_count_isr++;
 
-  lv_disp_draw_buf_init(&draw_buf, buf1, nullptr, SCREEN_W * LVGL_BUF_LINES);
+  // stop at target (only set flag-ish by checking count)
+  // real stop in loop (safe, no heavy things in ISR)
+}
+
+// =====================================================
+// Setup / Loop
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // GPIO
+  pinMode(GPIO_MOTOR, OUTPUT);
+  motor_set(false);
+
+  pinMode(GPIO_SENSOR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(GPIO_SENSOR), sensor_isr, FALLING);
+
+  // Preferences
+  prefs.begin("bandware", false);
+  g_target = prefs.getUInt("target", 100);
+  g_target = clamp_u32(g_target, 1, 1000);
+  uint32_t deb_ms = prefs.getUInt("deb_ms", 3);
+  deb_ms = clamp_u32(deb_ms, 1, 20);
+  g_debounce_us = deb_ms * 1000UL;
+
+  // LCD
+  lcd.begin();
+
+  // LVGL
+  lv_init();
+  lv_disp_draw_buf_init(&draw_buf, buf1, nullptr, SCREEN_W * 20);
 
   static lv_disp_drv_t disp_drv;
   lv_disp_drv_init(&disp_drv);
@@ -579,72 +729,42 @@ static void init_lvgl() {
   disp_drv.draw_buf = &draw_buf;
   lv_disp_drv_register(&disp_drv);
 
-  static lv_indev_drv_t indev_drv;
-  lv_indev_drv_init(&indev_drv);
-  indev_drv.type = LV_INDEV_TYPE_POINTER;
-  indev_drv.read_cb = touch_read_cb;
-  lv_indev_drv_register(&indev_drv);
-}
-
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-
-  // prefs
-  prefs.begin("bandware", false);
-  g_target = prefs.getUShort("target", 100);
-  g_debounce_ms = prefs.getUShort("deb", DEBOUNCE_MS_DEFAULT);
-  if (g_target < 1) g_target = 1;
-  if (g_target > 1000) g_target = 1000;
-  if (g_debounce_ms < 2) g_debounce_ms = 2;
-  if (g_debounce_ms > 10) g_debounce_ms = 10;
-
-  // GPIO
-  pinMode(GPIO_MOTOR, OUTPUT);
-  motor_set(false);
-
-  pinMode(GPIO_SENSOR, INPUT_PULLUP); // PC817 output, falling edge pulses
-  attachInterrupt(digitalPinToInterrupt(GPIO_SENSOR), sensor_isr, FALLING);
-
-  // LCD
-  lcd.begin();
-
-  // Touch I2C
-  if (USE_GT911) {
-    Wire.begin(TOUCH_I2C_SDA, TOUCH_I2C_SCL);
-    Wire.setClock(400000);
+  // Touch
+  bool touch_ok = gt911_begin();
+  if (touch_ok) {
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = touch_cb;
+    lv_indev_drv_register(&indev_drv);
+  } else {
+    Serial.println("WARN: GT911 not found. Try GT911_ADDR 0x14 or check SDA/SCL pins.");
   }
 
-  // LVGL
-  init_lvgl();
   init_styles();
   build_ui();
-
-  ui_set_status(State::IDLE);
-  ui_update_numbers();
-
-  Serial.println("[OK] BandwareZaehler gestartet.");
 }
 
 void loop() {
-  // tick for LVGL (no blocking)
-  static uint32_t last_ms = millis();
-  uint32_t now = millis();
-  uint32_t diff = now - last_ms;
-  last_ms = now;
-  lv_tick_inc(diff);
+  // UI/task loop
+  lv_timer_handler();
+  delay(5);
 
-  // pull ISR count
-  uint32_t c = g_count_isr;
-  if (c != g_count) {
-    g_count = c;
-    ui_update_numbers();
-    if (g_state == State::RUNNING && g_target > 0 && g_count >= g_target) {
+  // RUNNING logic
+  if (g_state == State::RUNNING) {
+    uint32_t c = g_count_isr;
+    if (c >= g_target) {
       motor_set(false);
       ui_set_status(State::DONE);
     }
+    ui_update_numbers();
+  } else {
+    // update sometimes (cheap)
+    static uint32_t last = 0;
+    uint32_t ms = millis();
+    if (ms - last > 150) {
+      last = ms;
+      ui_update_numbers();
+    }
   }
-
-  lv_timer_handler();
-  delay(5);
 }
