@@ -33,7 +33,7 @@ static const uint8_t GT911_ADDR = 0x5D;  // common 0x5D or 0x14
 static const uint16_t DEBOUNCE_MS_DEFAULT = 3; // 2..10ms typical
 
 /* LVGL draw buffer lines */
-static const int LVGL_BUF_LINES = 20;
+static const int LVGL_BUF_LINES = 60; // افزایش بافر
 
 /* =========================
    Global Variables
@@ -51,6 +51,7 @@ static Preferences prefs;
    ========================= */
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf1[SCREEN_W * LVGL_BUF_LINES];
+static lv_color_t buf2[SCREEN_W * LVGL_BUF_LINES]; // بافر دوم برای عملکرد بهتر
 
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Bus_RGB bus;
@@ -61,41 +62,50 @@ public:
     {
       auto cfg = bus.config();
 
-      cfg.pin_d0  = GPIO_NUM_15;
-      cfg.pin_d1  = GPIO_NUM_7;
-      cfg.pin_d2  = GPIO_NUM_6;
-      cfg.pin_d3  = GPIO_NUM_5;
-      cfg.pin_d4  = GPIO_NUM_4;
-      cfg.pin_d5  = GPIO_NUM_9;
-      cfg.pin_d6  = GPIO_NUM_46;
-      cfg.pin_d7  = GPIO_NUM_3;
-      cfg.pin_d8  = GPIO_NUM_8;
-      cfg.pin_d9  = GPIO_NUM_16;
-      cfg.pin_d10 = GPIO_NUM_1;
-      cfg.pin_d11 = GPIO_NUM_14;
-      cfg.pin_d12 = GPIO_NUM_21;
-      cfg.pin_d13 = GPIO_NUM_47;
-      cfg.pin_d14 = GPIO_NUM_48;
-      cfg.pin_d15 = GPIO_NUM_45;
+      // پین‌های داده RGB - تنظیم برای بیشتر LCD های 800x480
+      cfg.pin_d0  = GPIO_NUM_15;  // B0
+      cfg.pin_d1  = GPIO_NUM_7;   // B1
+      cfg.pin_d2  = GPIO_NUM_6;   // B2
+      cfg.pin_d3  = GPIO_NUM_5;   // B3
+      cfg.pin_d4  = GPIO_NUM_4;   // B4
+      cfg.pin_d5  = GPIO_NUM_9;   // B5
+      cfg.pin_d6  = GPIO_NUM_46;  // B6
+      cfg.pin_d7  = GPIO_NUM_3;   // B7
+      
+      cfg.pin_d8  = GPIO_NUM_8;   // G0
+      cfg.pin_d9  = GPIO_NUM_16;  // G1
+      cfg.pin_d10 = GPIO_NUM_1;   // G2
+      cfg.pin_d11 = GPIO_NUM_14;  // G3
+      cfg.pin_d12 = GPIO_NUM_21;  // G4
+      cfg.pin_d13 = GPIO_NUM_47;  // G5
+      cfg.pin_d14 = GPIO_NUM_48;  // G6
+      cfg.pin_d15 = GPIO_NUM_45;  // G7
 
-      cfg.pin_henable = GPIO_NUM_41; // DE
-      cfg.pin_vsync   = GPIO_NUM_40;
-      cfg.pin_hsync   = GPIO_NUM_39;
-      cfg.pin_pclk    = GPIO_NUM_42;
+      // پین‌های کنترل
+      cfg.pin_henable = GPIO_NUM_41; // DE (Data Enable)
+      cfg.pin_vsync   = GPIO_NUM_40; // VSYNC
+      cfg.pin_hsync   = GPIO_NUM_39; // HSYNC
+      cfg.pin_pclk    = GPIO_NUM_42; // PCLK
 
-      cfg.freq_write = 12000000;
+      // فرکانس را کاهش می‌دهیم
+      cfg.freq_write = 8000000; // 8MHz به جای 12MHz
 
-      cfg.hsync_polarity    = 0;
-      cfg.hsync_front_porch = 8;
-      cfg.hsync_pulse_width = 2;
-      cfg.hsync_back_porch  = 43;
+      // تایمینگ HSYNC
+      cfg.hsync_polarity    = 0;     // Active low
+      cfg.hsync_front_porch = 40;    // افزایش
+      cfg.hsync_pulse_width = 48;    // افزایش
+      cfg.hsync_back_porch  = 88;    // افزایش
 
-      cfg.vsync_polarity    = 0;
-      cfg.vsync_front_porch = 8;
-      cfg.vsync_pulse_width = 2;
-      cfg.vsync_back_porch  = 12;
+      // تایمینگ VSYNC
+      cfg.vsync_polarity    = 0;     // Active low
+      cfg.vsync_front_porch = 13;    // افزایش
+      cfg.vsync_pulse_width = 32;    // افزایش
+      cfg.vsync_back_porch  = 32;    // افزایش
 
-      cfg.pclk_idle_high = 1;
+      cfg.pclk_idle_high    = 0;     // PCLK idle low
+      cfg.pclk_active_neg   = 0;     // PCLK active on rising edge
+      cfg.de_idle_high      = 0;     // DE idle low
+      cfg.de_active_high    = 1;     // DE active high
 
       bus.config(cfg);
       panel.setBus(&bus);
@@ -109,6 +119,14 @@ public:
       cfg.memory_height = SCREEN_H;
       cfg.offset_x = 0;
       cfg.offset_y = 0;
+      cfg.readable = false;
+      cfg.bus_shared = true;
+      
+      // تنظیم جهت صفحه
+      cfg.offset_rotation = 0;
+      cfg.rgb_order = false; // RGB order
+      cfg.dlen_16bit = true; // 16-bit data length
+      
       panel.config(cfg);
     }
 
@@ -186,7 +204,7 @@ static void flush_cb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* col
 
   lcd.startWrite();
   lcd.setAddrWindow(area->x1, area->y1, w, h);
-  lcd.writePixels((lgfx::rgb565_t*)color_p, w * h);
+  lcd.pushPixels((lgfx::rgb565_t*)color_p, w * h, true);
   lcd.endWrite();
 
   lv_disp_flush_ready(disp);
@@ -242,7 +260,7 @@ static lv_color_t ORANGE = lv_color_hex(0xFF7A00);
 static const char* state_text(State s) {
   switch (s) {
     case State::IDLE:    return "Bereit";
-    case State::RUNNING: return "Läuft…";
+    case State::RUNNING: return "Lauft...";
     case State::DONE:    return "Fertig: Bitte Band entnehmen";
     case State::STOPPED: return "Stopp";
     case State::ERROR:   return "Fehler";
@@ -490,9 +508,18 @@ static void build_ui() {
   lv_obj_t* scr = lv_scr_act();
   lv_obj_add_style(scr, &st_bg, 0);
 
+  // ابتدا یک تست ساده برای اطمینان از کارکرد LCD
+  lv_obj_t* test_label = lv_label_create(scr);
+  lv_label_set_text(test_label, "LCD Test...");
+  lv_obj_set_style_text_font(test_label, &lv_font_montserrat_48, 0);
+  lv_obj_align(test_label, LV_ALIGN_CENTER, 0, 0);
+  lv_timer_handler();
+  delay(1000); // نمایش تست به مدت 1 ثانیه
+  lv_obj_del(test_label);
+
   // Title
   lv_obj_t* title = lv_label_create(scr);
-  lv_label_set_text(title, "Bandware Zähler");
+  lv_label_set_text(title, "Bandware Zahler");
   lv_obj_add_style(title, &st_title, 0);
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 24, 16);
 
@@ -572,7 +599,8 @@ static void build_ui() {
 static void init_lvgl() {
   lv_init();
 
-  lv_disp_draw_buf_init(&draw_buf, buf1, nullptr, SCREEN_W * LVGL_BUF_LINES);
+  // استفاده از دو بافر برای عملکرد بهتر
+  lv_disp_draw_buf_init(&draw_buf, buf1, buf2, SCREEN_W * LVGL_BUF_LINES);
 
   static lv_disp_drv_t disp_drv;
   lv_disp_drv_init(&disp_drv);
@@ -580,13 +608,18 @@ static void init_lvgl() {
   disp_drv.ver_res = SCREEN_H;
   disp_drv.flush_cb = flush_cb;
   disp_drv.draw_buf = &draw_buf;
+  disp_drv.full_refresh = 0; // Full refresh only when needed
   lv_disp_t* disp = lv_disp_drv_register(&disp_drv);
 
   static lv_indev_drv_t indev_drv;
   lv_indev_drv_init(&indev_drv);
   indev_drv.type = LV_INDEV_TYPE_POINTER;
   indev_drv.read_cb = touch_read_cb;
-  lv_indev_drv_register(&indev_drv);
+  lv_indev_t* indev = lv_indev_drv_register(&indev_drv);
+  
+  // لینک صفحه نمایش و تاچ
+  lv_disp_set_default(disp);
+  lv_indev_set_group(indev, lv_group_get_default());
 }
 
 /* =========================
@@ -594,7 +627,9 @@ static void init_lvgl() {
    ========================= */
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  Serial.println("\n\nStarting BandwareZahler...");
+  
+  delay(500); // تأخیر برای راه‌اندازی سریال
 
   // Load preferences
   prefs.begin("bandware", false);
@@ -613,24 +648,49 @@ void setup() {
   pinMode(GPIO_SENSOR, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(GPIO_SENSOR), sensor_isr, FALLING);
 
-  // LCD Initialize
-  lcd.begin();
+  Serial.println("GPIO initialized");
+
+  // LCD Initialize با تأخیر بیشتر
+  Serial.println("Initializing LCD...");
+  
+  // تست اولیه LCD
+  lcd.init();
+  delay(100);
+  
+  // چرخاندن صفحه در صورت نیاز
+  lcd.setRotation(0);
+  
+  // تست رنگ
+  lcd.fillScreen(TFT_RED);
+  delay(300);
+  lcd.fillScreen(TFT_GREEN);
+  delay(300);
+  lcd.fillScreen(TFT_BLUE);
+  delay(300);
+  lcd.fillScreen(TFT_BLACK);
+  delay(300);
+  
+  Serial.println("LCD test done");
 
   // Touch I2C
   if (USE_GT911) {
     Wire.begin(TOUCH_I2C_SDA, TOUCH_I2C_SCL);
     Wire.setClock(400000);
+    Serial.println("Touch I2C initialized");
   }
 
   // LVGL Initialize
+  Serial.println("Initializing LVGL...");
   init_lvgl();
+  
+  Serial.println("Creating UI...");
   init_styles();
   build_ui();
 
   ui_set_status(State::IDLE);
   ui_update_numbers();
 
-  Serial.println("[OK] BandwareZaehler gestartet.");
+  Serial.println("[OK] BandwareZahler gestartet.");
 }
 
 void loop() {
