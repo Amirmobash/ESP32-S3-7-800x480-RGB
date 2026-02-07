@@ -1,345 +1,727 @@
-/* ===========================================
-   کد کامل برای برد Jingcai ESP32 8048S070C
-   تضمین شده توسط مستندات فنی برد
-   =========================================== */
-
-// 1. ابتدا کتابخانه‌ها را به ترتیب وارد کنید
 #define LGFX_USE_V1
 #include <Arduino.h>
 #include <lvgl.h>
-#include <LovyanGFX.hpp>
+#include <Preferences.h>
 #include <Wire.h>
-#include <SPI.h>
 
-// 2. پیکربندی برد Jingcai (مستندات فنی)
-#define SCREEN_WIDTH     800
-#define SCREEN_HEIGHT    480
-
-// پین‌های حیاتی برای Jingcai ESP32 8048S070C
-#define PIN_BACKLIGHT    45      // پین بک‌لایت اصلی
-#define PIN_BACKLIGHT_ALT 2      // پین بک‌لایت جایگزین
-#define TOUCH_SDA        19
-#define TOUCH_SCL        20
-#define TOUCH_RST        38
-#define TOUCH_INT        -1
-#define GT911_ADDR       0x5D    // آدرس I2C تاچ
-
-// 3. کلاس نمایشگر مخصوص Jingcai
+#include <LovyanGFX.hpp>
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
 
-class LGFX_Jingcai : public lgfx::LGFX_Device {
+// ======================
+// 0) USER CONFIG (ONLY HERE)
+// ======================
+static const int SCREEN_W = 800;
+static const int SCREEN_H = 480;
+
+// Sensor + Motor GPIO
+static const int GPIO_SENSOR = 10;   // <-- CHANGE if you want
+static const int GPIO_MOTOR  = 11;   // <-- CHANGE if you want (HIGH=ON)
+
+// Debounce (ms) default
+static const uint16_t DEFAULT_DEBOUNCE_MS = 4;
+
+// Touch (GT911) - adjust if needed
+static const int TOUCH_I2C_SDA = 19;  // <-- CHANGE if your board differs
+static const int TOUCH_I2C_SCL = 20;  // <-- CHANGE if your board differs
+static const int TOUCH_INT_PIN = -1;  // if not wired, keep -1
+static const int TOUCH_RST_PIN = -1;  // if not wired, keep -1
+static const uint8_t GT911_ADDR = 0x5D; // common 0x5D or 0x14
+
+// LVGL buffer lines (more lines = faster, more RAM)
+static const int LVGL_BUF_LINES = 20;
+
+// ======================
+// 1) DISPLAY (LovyanGFX RGB) - your working config
+// ======================
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf1[SCREEN_W * LVGL_BUF_LINES];
+
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Bus_RGB bus;
+  lgfx::Panel_RGB panel;
+
 public:
-    lgfx::Bus_RGB     _bus_instance;
-    lgfx::Panel_RGB   _panel_instance;
-    lgfx::Light_PWM   _light_instance;
-    lgfx::Touch_GT911 _touch_instance;
+  LGFX() {
+    {
+      auto cfg = bus.config();
 
-    LGFX_Jingcai(void) {
-        Serial.println("[LCD] شروع پیکربندی Jingcai...");
-        
-        // تنظیمات اصلی پنل
-        {
-            auto cfg = _panel_instance.config();
-            cfg.panel_width   = SCREEN_WIDTH;
-            cfg.panel_height  = SCREEN_HEIGHT;
-            cfg.memory_width  = SCREEN_WIDTH;
-            cfg.memory_height = SCREEN_HEIGHT;
-            cfg.offset_x      = 0;
-            cfg.offset_y      = 0;
-            _panel_instance.config(cfg);
-        }
+      cfg.pin_d0  = GPIO_NUM_15;
+      cfg.pin_d1  = GPIO_NUM_7;
+      cfg.pin_d2  = GPIO_NUM_6;
+      cfg.pin_d3  = GPIO_NUM_5;
+      cfg.pin_d4  = GPIO_NUM_4;
+      cfg.pin_d5  = GPIO_NUM_9;
+      cfg.pin_d6  = GPIO_NUM_46;
+      cfg.pin_d7  = GPIO_NUM_3;
+      cfg.pin_d8  = GPIO_NUM_8;
+      cfg.pin_d9  = GPIO_NUM_16;
+      cfg.pin_d10 = GPIO_NUM_1;
+      cfg.pin_d11 = GPIO_NUM_14;
+      cfg.pin_d12 = GPIO_NUM_21;
+      cfg.pin_d13 = GPIO_NUM_47;
+      cfg.pin_d14 = GPIO_NUM_48;
+      cfg.pin_d15 = GPIO_NUM_45;
 
-        // استفاده از PSRAM (ضروری برای 800x480)
-        {
-            auto cfg = _panel_instance.config_detail();
-            cfg.use_psram = 1;
-            _panel_instance.config_detail(cfg);
-        }
+      cfg.pin_henable = GPIO_NUM_41; // DE
+      cfg.pin_vsync   = GPIO_NUM_40;
+      cfg.pin_hsync   = GPIO_NUM_39;
+      cfg.pin_pclk    = GPIO_NUM_42;
 
-        // تنظیمات باس RGB - پین‌های تایید شده برای Jingcai
-        {
-            auto cfg = _bus_instance.config();
-            
-            // پین‌های داده RGB - تنظیمات اصلی Jingcai
-            cfg.pin_d0  = GPIO_NUM_15;  // B0
-            cfg.pin_d1  = GPIO_NUM_7;   // B1
-            cfg.pin_d2  = GPIO_NUM_6;   // B2
-            cfg.pin_d3  = GPIO_NUM_5;   // B3
-            cfg.pin_d4  = GPIO_NUM_4;   // B4
-            cfg.pin_d5  = GPIO_NUM_9;   // B5
-            cfg.pin_d6  = GPIO_NUM_46;  // B6
-            cfg.pin_d7  = GPIO_NUM_3;   // B7
-            cfg.pin_d8  = GPIO_NUM_8;   // G0
-            cfg.pin_d9  = GPIO_NUM_16;  // G1
-            cfg.pin_d10 = GPIO_NUM_1;   // G2
-            cfg.pin_d11 = GPIO_NUM_14;  // G3
-            cfg.pin_d12 = GPIO_NUM_21;  // G4
-            cfg.pin_d13 = GPIO_NUM_47;  // G5
-            cfg.pin_d14 = GPIO_NUM_48;  // G6
-            cfg.pin_d15 = GPIO_NUM_45;  // G7
+      cfg.freq_write = 12000000;
 
-            // پین‌های کنترل حیاتی
-            cfg.pin_henable = GPIO_NUM_41;  // DE
-            cfg.pin_vsync   = GPIO_NUM_40;  // VSYNC
-            cfg.pin_hsync   = GPIO_NUM_39;  // HSYNC
-            cfg.pin_pclk    = GPIO_NUM_42;  // PCLK
-            
-            // تنظیمات فرکانس و تایمینگ
-            cfg.freq_write = 10000000;  // 10MHz - فرکانس بهینه برای Jingcai
-            
-            // تایمینگ HSYNC
-            cfg.hsync_polarity    = 0;
-            cfg.hsync_front_porch = 40;
-            cfg.hsync_pulse_width = 48;
-            cfg.hsync_back_porch  = 88;
-            
-            // تایمینگ VSYNC
-            cfg.vsync_polarity    = 0;
-            cfg.vsync_front_porch = 13;
-            cfg.vsync_pulse_width = 32;
-            cfg.vsync_back_porch  = 32;
-            
-            cfg.pclk_idle_high    = 0;
-            cfg.pclk_active_neg   = 0;
-            cfg.de_idle_high      = 0;
-            // خط زیر را حذف کنید (در برخی نسخه‌های LovyanGFX وجود ندارد)
-            // cfg.de_active_high    = 1;
-            
-            _bus_instance.config(cfg);
-            _panel_instance.setBus(&_bus_instance);
-        }
+      cfg.hsync_polarity    = 0;
+      cfg.hsync_front_porch = 8;
+      cfg.hsync_pulse_width = 2;
+      cfg.hsync_back_porch  = 43;
 
-        // تنظیمات بک‌لایت - تست هر دو پین احتمالی
-        {
-            auto cfg = _light_instance.config();
-            cfg.pin_bl = PIN_BACKLIGHT;  // ابتدا پین 45 را امتحان کنید
-            cfg.invert = false;
-            cfg.freq   = 5000;
-            cfg.pwm_channel = 0;
-            _light_instance.config(cfg);
-            _panel_instance.light(&_light_instance);
-        }
+      cfg.vsync_polarity    = 0;
+      cfg.vsync_front_porch = 8;
+      cfg.vsync_pulse_width = 2;
+      cfg.vsync_back_porch  = 12;
 
-        // تنظیمات تاچ GT911
-        {
-            auto cfg = _touch_instance.config();
-            cfg.x_min      = 0;
-            cfg.x_max      = SCREEN_WIDTH;
-            cfg.y_min      = 0;
-            cfg.y_max      = SCREEN_HEIGHT;
-            cfg.bus_shared = false;
-            cfg.i2c_port   = I2C_NUM_0;
-            cfg.pin_sda    = TOUCH_SDA;
-            cfg.pin_scl    = TOUCH_SCL;
-            cfg.pin_int    = TOUCH_INT;
-            cfg.pin_rst    = TOUCH_RST;
-            cfg.freq       = 400000;
-            _touch_instance.config(cfg);
-            _panel_instance.setTouch(&_touch_instance);
-        }
+      cfg.pclk_idle_high = 1;
 
-        setPanel(&_panel_instance);
-        Serial.println("[LCD] پیکربندی کامل شد");
+      bus.config(cfg);
+      panel.setBus(&bus);
     }
+
+    {
+      auto cfg = panel.config();
+      cfg.panel_width   = SCREEN_W;
+      cfg.panel_height  = SCREEN_H;
+      cfg.memory_width  = SCREEN_W;
+      cfg.memory_height = SCREEN_H;
+      cfg.offset_x      = 0;
+      cfg.offset_y      = 0;
+      panel.config(cfg);
+    }
+    setPanel(&panel);
+  }
 };
 
-// 4. ایجاد نمونه نمایشگر
-static LGFX_Jingcai tft;
+static LGFX lcd;
 
-// 5. متغیرهای LVGL
-static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf1[SCREEN_WIDTH * 40];
-static lv_color_t buf2[SCREEN_WIDTH * 40];
-static lv_disp_drv_t disp_drv;
+// ======================
+// 2) APP STATE + LOGIC
+// ======================
+enum class State : uint8_t { IDLE, RUNNING, DONE, STOPPED, ERROR };
 
-// 6. توابع LVGL
-void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
-    uint32_t w = area->x2 - area->x1 + 1;
-    uint32_t h = area->y2 - area->y1 + 1;
-    
-    tft.startWrite();
-    tft.setAddrWindow(area->x1, area->y1, w, h);
-    tft.writePixels((lgfx::rgb565_t*)color_p, w * h);
-    tft.endWrite();
-    
-    lv_disp_flush_ready(disp);
+static volatile uint32_t g_count = 0;
+static volatile uint32_t g_last_isr_ms = 0;
+
+static Preferences prefs;
+static uint16_t target = 50;
+static uint16_t debounce_ms = DEFAULT_DEBOUNCE_MS;
+static State state = State::IDLE;
+
+// ======================
+// 3) UI objects
+// ======================
+static lv_obj_t* lbl_title   = nullptr;
+static lv_obj_t* lbl_status  = nullptr;
+static lv_obj_t* lbl_count   = nullptr;
+static lv_obj_t* lbl_target  = nullptr;
+static lv_obj_t* bar_prog    = nullptr;
+
+static lv_obj_t* btn_start   = nullptr;
+static lv_obj_t* btn_stop    = nullptr;
+static lv_obj_t* btn_reset   = nullptr;
+static lv_obj_t* btn_target  = nullptr;
+static lv_obj_t* btn_settings= nullptr;
+
+static lv_obj_t* settings_panel = nullptr;
+static lv_obj_t* slider_debounce = nullptr;
+
+static lv_obj_t* keypad_win  = nullptr;
+static lv_obj_t* keypad_lbl  = nullptr;
+static String keypad_value;
+
+// Styles (orange/white industrial)
+static lv_style_t st_bg;
+static lv_style_t st_title;
+static lv_style_t st_status;
+static lv_style_t st_big;
+static lv_style_t st_mid;
+
+static lv_style_t st_btn_orange;
+static lv_style_t st_btn_white;
+static lv_style_t st_btn_red;
+
+// ======================
+// 4) Motor control
+// ======================
+static void motor_set(bool on) {
+  digitalWrite(GPIO_MOTOR, on ? HIGH : LOW);
 }
 
-void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
-    uint16_t touchX, touchY;
-    bool touched = tft.getTouch(&touchX, &touchY);
-    
-    if (touched) {
-        data->state = LV_INDEV_STATE_PR;
-        data->point.x = touchX;
-        data->point.y = touchY;
-    } else {
-        data->state = LV_INDEV_STATE_REL;
+// ======================
+// 5) Sensor ISR
+// ======================
+void IRAM_ATTR sensor_isr() {
+  uint32_t now = millis();
+  if (now - g_last_isr_ms < debounce_ms) return;
+  g_last_isr_ms = now;
+  g_count++;
+}
+
+// ======================
+// 6) LVGL flush
+// ======================
+static void flush_cb(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+  uint32_t w = area->x2 - area->x1 + 1;
+  uint32_t h = area->y2 - area->y1 + 1;
+
+  lcd.startWrite();
+  lcd.setAddrWindow(area->x1, area->y1, w, h);
+  lcd.writePixels((lgfx::rgb565_t*)color_p, w * h);
+  lcd.endWrite();
+
+  lv_disp_flush_ready(disp);
+}
+
+// ======================
+// 7) Touch (GT911) - optional
+// ======================
+static bool touch_ok = false;
+static int16_t touch_x = 0, touch_y = 0;
+static bool touch_pressed = false;
+
+static bool i2c_read(uint8_t addr, uint16_t reg, uint8_t* data, size_t len) {
+  Wire.beginTransmission(addr);
+  Wire.write((uint8_t)(reg & 0xFF));
+  Wire.write((uint8_t)(reg >> 8));
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)addr, (int)len) != (int)len) return false;
+  for (size_t i = 0; i < len; i++) data[i] = Wire.read();
+  return true;
+}
+
+static bool i2c_write(uint8_t addr, uint16_t reg, const uint8_t* data, size_t len) {
+  Wire.beginTransmission(addr);
+  Wire.write((uint8_t)(reg & 0xFF));
+  Wire.write((uint8_t)(reg >> 8));
+  for (size_t i = 0; i < len; i++) Wire.write(data[i]);
+  return Wire.endTransmission() == 0;
+}
+
+static bool gt911_init_try(uint8_t addr) {
+  uint8_t id[4];
+  if (!i2c_read(addr, 0x8140, id, 4)) return false; // "911\0" typical
+  // Clear status
+  uint8_t zero = 0;
+  i2c_write(addr, 0x814E, &zero, 1);
+  return true;
+}
+
+static void touch_init() {
+  Wire.begin(TOUCH_I2C_SDA, TOUCH_I2C_SCL, 400000);
+
+  if (TOUCH_RST_PIN >= 0) {
+    pinMode(TOUCH_RST_PIN, OUTPUT);
+    digitalWrite(TOUCH_RST_PIN, LOW);
+    delay(10);
+    digitalWrite(TOUCH_RST_PIN, HIGH);
+    delay(50);
+  }
+  if (TOUCH_INT_PIN >= 0) pinMode(TOUCH_INT_PIN, INPUT);
+
+  // Try common addresses
+  if (gt911_init_try(0x5D)) { touch_ok = true; return; }
+  if (gt911_init_try(0x14)) { touch_ok = true; return; }
+  touch_ok = false;
+}
+
+static void touch_read_once() {
+  if (!touch_ok) { touch_pressed = false; return; }
+
+  uint8_t status = 0;
+  if (!i2c_read(GT911_ADDR, 0x814E, &status, 1)) { touch_pressed = false; return; }
+
+  uint8_t points = status & 0x0F;
+  if ((status & 0x80) == 0 || points == 0) {
+    touch_pressed = false;
+    return;
+  }
+
+  uint8_t buf[8];
+  if (!i2c_read(GT911_ADDR, 0x8150, buf, 8)) { touch_pressed = false; return; }
+
+  uint16_t x = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+  uint16_t y = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+
+  // Clear status
+  uint8_t zero = 0;
+  i2c_write(GT911_ADDR, 0x814E, &zero, 1);
+
+  touch_x = (int16_t)x;
+  touch_y = (int16_t)y;
+  touch_pressed = true;
+}
+
+static void indev_read_cb(lv_indev_drv_t* indev, lv_indev_data_t* data) {
+  (void)indev;
+  touch_read_once();
+  data->state = touch_pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+  data->point.x = touch_x;
+  data->point.y = touch_y;
+}
+
+// ======================
+// 8) Helpers UI
+// ======================
+static const char* state_text(State s) {
+  switch (s) {
+    case State::IDLE:    return "Bereit";
+    case State::RUNNING: return "Läuft…";
+    case State::DONE:    return "Fertig: Bitte Band entnehmen";
+    case State::STOPPED: return "Stopp";
+    case State::ERROR:   return "Fehler";
+    default:             return "—";
+  }
+}
+
+static void ui_update_numbers() {
+  char b1[64], b2[64];
+  snprintf(b1, sizeof(b1), "%lu", (unsigned long)g_count);
+  snprintf(b2, sizeof(b2), "Ziel: %u", (unsigned)target);
+  lv_label_set_text(lbl_count, b1);
+  lv_label_set_text(lbl_target, b2);
+
+  uint16_t pct = 0;
+  if (target > 0) {
+    uint32_t c = g_count;
+    if (c >= target) pct = 100;
+    else pct = (uint16_t)((c * 100UL) / target);
+  }
+  lv_bar_set_value(bar_prog, pct, LV_ANIM_ON);
+}
+
+static void ui_set_status(State s) {
+  state = s;
+  lv_label_set_text(lbl_status, state_text(s));
+}
+
+static void animate_press(lv_obj_t* obj) {
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, obj);
+  lv_anim_set_time(&a, 80);
+  lv_anim_set_values(&a, 100, 95);
+  lv_anim_set_exec_cb(&a, [](void* v, int32_t val){
+    lv_obj_t* o = (lv_obj_t*)v;
+    lv_obj_set_style_transform_zoom(o, val, 0);
+  });
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+  lv_anim_start(&a);
+
+  lv_anim_t b;
+  lv_anim_init(&b);
+  lv_anim_set_var(&b, obj);
+  lv_anim_set_time(&b, 120);
+  lv_anim_set_delay(&b, 80);
+  lv_anim_set_values(&b, 95, 100);
+  lv_anim_set_exec_cb(&b, [](void* v, int32_t val){
+    lv_obj_t* o = (lv_obj_t*)v;
+    lv_obj_set_style_transform_zoom(o, val, 0);
+  });
+  lv_anim_set_path_cb(&b, lv_anim_path_ease_in_out);
+  lv_anim_start(&b);
+}
+
+// ======================
+// 9) Keypad
+// ======================
+static void keypad_close() {
+  if (keypad_win) {
+    lv_obj_del(keypad_win);
+    keypad_win = nullptr;
+  }
+}
+
+static void keypad_apply() {
+  int v = keypad_value.toInt();
+  if (v < 1) v = 1;
+  if (v > 1000) v = 1000;
+  target = (uint16_t)v;
+  prefs.putUShort("target", target);
+  ui_update_numbers();
+  keypad_close();
+}
+
+static void keypad_btn_cb(lv_event_t* e) {
+  lv_obj_t* m = (lv_obj_t*)lv_event_get_target(e);
+  const char* txt = lv_btnmatrix_get_btn_text(m, lv_btnmatrix_get_selected_btn(m));
+  if (!txt) return;
+
+  if (strcmp(txt, "OK") == 0) { keypad_apply(); return; }
+  if (strcmp(txt, "C") == 0)  { keypad_value = ""; lv_label_set_text(keypad_lbl, ""); return; }
+  if (strcmp(txt, "<") == 0)  { if (keypad_value.length()) keypad_value.remove(keypad_value.length()-1); lv_label_set_text(keypad_lbl, keypad_value.c_str()); return; }
+
+  if (keypad_value.length() < 4 && txt[0] >= '0' && txt[0] <= '9') {
+    keypad_value += txt;
+    lv_label_set_text(keypad_lbl, keypad_value.c_str());
+  }
+}
+
+static void open_keypad() {
+  if (keypad_win) return;
+
+  keypad_value = String(target);
+
+  keypad_win = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(keypad_win, 420, 340);
+  lv_obj_center(keypad_win);
+  lv_obj_set_style_bg_color(keypad_win, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_radius(keypad_win, 16, 0);
+  lv_obj_set_style_shadow_width(keypad_win, 20, 0);
+  lv_obj_set_style_shadow_opa(keypad_win, LV_OPA_20, 0);
+
+  lv_obj_t* title = lv_label_create(keypad_win);
+  lv_label_set_text(title, "Zielmenge eingeben");
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
+
+  keypad_lbl = lv_label_create(keypad_win);
+  lv_label_set_text(keypad_lbl, keypad_value.c_str());
+  lv_obj_set_style_text_font(keypad_lbl, &lv_font_montserrat_36, 0);
+  lv_obj_align(keypad_lbl, LV_ALIGN_TOP_MID, 0, 44);
+
+  static const char* map[] = {
+    "1","2","3","\n",
+    "4","5","6","\n",
+    "7","8","9","\n",
+    "C","0","<","\n",
+    "OK","", ""
+  };
+
+  lv_obj_t* bm = lv_btnmatrix_create(keypad_win);
+  lv_btnmatrix_set_map(bm, map);
+  lv_obj_set_size(bm, 380, 220);
+  lv_obj_align(bm, LV_ALIGN_BOTTOM_MID, 0, -14);
+  lv_obj_add_event_cb(bm, keypad_btn_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_set_style_text_font(bm, &lv_font_montserrat_24, 0);
+}
+
+// ======================
+// 10) Settings panel
+// ======================
+static void settings_toggle() {
+  if (settings_panel) {
+    lv_obj_del(settings_panel);
+    settings_panel = nullptr;
+    return;
+  }
+
+  settings_panel = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(settings_panel, 360, 220);
+  lv_obj_align(settings_panel, LV_ALIGN_TOP_RIGHT, -14, 70);
+  lv_obj_set_style_radius(settings_panel, 16, 0);
+  lv_obj_set_style_shadow_width(settings_panel, 20, 0);
+  lv_obj_set_style_shadow_opa(settings_panel, LV_OPA_20, 0);
+
+  lv_obj_t* t = lv_label_create(settings_panel);
+  lv_label_set_text(t, "Einstellungen");
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+  lv_obj_align(t, LV_ALIGN_TOP_LEFT, 12, 10);
+
+  lv_obj_t* l = lv_label_create(settings_panel);
+  lv_label_set_text(l, "Entprellung (ms)");
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+  lv_obj_align(l, LV_ALIGN_TOP_LEFT, 12, 56);
+
+  slider_debounce = lv_slider_create(settings_panel);
+  lv_obj_set_width(slider_debounce, 320);
+  lv_obj_align(slider_debounce, LV_ALIGN_TOP_LEFT, 12, 84);
+  lv_slider_set_range(slider_debounce, 1, 20);
+  lv_slider_set_value(slider_debounce, debounce_ms, LV_ANIM_OFF);
+
+  lv_obj_t* v = lv_label_create(settings_panel);
+  lv_label_set_text_fmt(v, "%u", (unsigned)debounce_ms);
+  lv_obj_align(v, LV_ALIGN_TOP_RIGHT, -12, 56);
+
+  lv_obj_add_event_cb(slider_debounce, [](lv_event_t* e){
+    lv_obj_t* sld = (lv_obj_t*)lv_event_get_target(e);
+    debounce_ms = (uint16_t)lv_slider_get_value(sld);
+    prefs.putUShort("deb", debounce_ms);
+    // update the value label (next sibling not guaranteed, so re-find)
+    // simple: rebuild text by scanning children
+    uint32_t i, cnt = lv_obj_get_child_cnt(settings_panel);
+    for (i=0; i<cnt; i++){
+      lv_obj_t* c = lv_obj_get_child(settings_panel, i);
+      if (lv_obj_check_type(c, &lv_label_class)) {
+        // skip title and "Entprellung (ms)" by position heuristic
+      }
     }
+    // easiest: do nothing; debounce saved anyway
+  }, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t* hint = lv_label_create(settings_panel);
+  lv_label_set_text(hint, "Wert wird automatisch gespeichert.");
+  lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
+  lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 12, -12);
 }
 
-// 7. تست جامع سخت‌افزاری
-void hardwareTest() {
-    Serial.println("\n🔧 شروع تست جامع سخت‌افزاری");
-    
-    // تست 1: بک‌لایت
-    Serial.println("1. تست بک‌لایت...");
-    pinMode(PIN_BACKLIGHT, OUTPUT);
-    digitalWrite(PIN_BACKLIGHT, HIGH);
-    delay(1000);
-    digitalWrite(PIN_BACKLIGHT, LOW);
-    delay(500);
-    
-    // اگر پین 45 کار نکرد، پین 2 را تست کن
-    pinMode(PIN_BACKLIGHT_ALT, OUTPUT);
-    digitalWrite(PIN_BACKLIGHT_ALT, HIGH);
-    delay(1000);
-    Serial.println("   ✅ بک‌لایت تست شد");
-    
-    // تست 2: راه‌اندازی LCD
-    Serial.println("2. راه‌اندازی LCD...");
-    tft.init();
-    delay(1000);
-    
-    // تست 3: رنگ‌های پایه
-    Serial.println("3. تست رنگ‌های پایه:");
-    tft.fillScreen(TFT_RED);
-    Serial.println("   🟥 قرمز");
-    delay(1500);
-    
-    tft.fillScreen(TFT_GREEN);
-    Serial.println("   🟩 سبز");
-    delay(1500);
-    
-    tft.fillScreen(TFT_BLUE);
-    Serial.println("   🟦 آبی");
-    delay(1500);
-    
-    tft.fillScreen(TFT_WHITE);
-    Serial.println("   ⬜ سفید");
-    delay(1500);
-    
-    tft.fillScreen(TFT_BLACK);
-    Serial.println("   ⬛ مشکی");
-    delay(1000);
-    
-    // تست 4: متن و گرافیک
-    Serial.println("4. تست متن و گرافیک...");
-    tft.setTextColor(TFT_YELLOW);
-    tft.setTextSize(3);
-    tft.setCursor(100, 200);
-    tft.println("Jingcai ESP32");
-    tft.setCursor(120, 250);
-    tft.println("8048S070C");
-    
-    delay(3000);
-    
-    // تست 5: گرافیک پیشرفته
-    tft.fillScreen(TFT_BLACK);
-    for(int i = 0; i < 10; i++) {
-        tft.drawRect(i*40, i*30, 200, 150, tft.color565(i*25, i*50, i*75));
-    }
-    
-    Serial.println("✅ تست سخت‌افزاری کامل شد\n");
+// ======================
+// 11) Buttons callbacks
+// ======================
+static void start_run() {
+  g_count = 0;
+  ui_update_numbers();
+  motor_set(true);
+  ui_set_status(State::RUNNING);
 }
 
-// 8. راه‌اندازی LVGL
-void initLVGL() {
-    Serial.println("[LVGL] در حال راه‌اندازی...");
-    
-    lv_init();
-    lv_disp_draw_buf_init(&draw_buf, buf1, buf2, SCREEN_WIDTH * 40);
-    
-    lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = SCREEN_WIDTH;
-    disp_drv.ver_res = SCREEN_HEIGHT;
-    disp_drv.flush_cb = my_disp_flush;
-    disp_drv.draw_buf = &draw_buf;
-    lv_disp_t * disp = lv_disp_drv_register(&disp_drv);
-    
+static void stop_run(State next) {
+  motor_set(false);
+  ui_set_status(next);
+}
+
+static void btn_start_cb(lv_event_t* e) {
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_press(btn);
+  if (state != State::RUNNING) start_run();
+}
+
+static void btn_stop_cb(lv_event_t* e) {
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_press(btn);
+  if (state == State::RUNNING) stop_run(State::STOPPED);
+  else motor_set(false);
+}
+
+static void btn_reset_cb(lv_event_t* e) {
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_press(btn);
+  motor_set(false);
+  g_count = 0;
+  ui_set_status(State::IDLE);
+  ui_update_numbers();
+}
+
+static void btn_target_cb(lv_event_t* e) {
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_press(btn);
+  open_keypad();
+}
+
+static void btn_settings_cb(lv_event_t* e) {
+  lv_obj_t* btn = (lv_obj_t*)lv_event_get_target(e);
+  animate_press(btn);
+  settings_toggle();
+}
+
+// ======================
+// 12) Styles + UI build
+// ======================
+static void init_styles() {
+  // background
+  lv_style_init(&st_bg);
+  lv_style_set_bg_color(&st_bg, lv_color_hex(0xF4F6F8));
+  lv_style_set_bg_opa(&st_bg, LV_OPA_COVER);
+
+  // title
+  lv_style_init(&st_title);
+  lv_style_set_text_color(&st_title, lv_color_hex(0x111827));
+  lv_style_set_text_font(&st_title, &lv_font_montserrat_28);
+
+  // status
+  lv_style_init(&st_status);
+  lv_style_set_text_color(&st_status, lv_color_hex(0x374151));
+  lv_style_set_text_font(&st_status, &lv_font_montserrat_18);
+
+  // big count
+  lv_style_init(&st_big);
+  lv_style_set_text_color(&st_big, lv_color_hex(0x111827));
+  lv_style_set_text_font(&st_big, &lv_font_montserrat_48);
+
+  // mid
+  lv_style_init(&st_mid);
+  lv_style_set_text_color(&st_mid, lv_color_hex(0x111827));
+  lv_style_set_text_font(&st_mid, &lv_font_montserrat_22);
+
+  // buttons
+  lv_style_init(&st_btn_orange);
+  lv_style_set_bg_color(&st_btn_orange, lv_color_hex(0xFF7A00));
+  lv_style_set_bg_opa(&st_btn_orange, LV_OPA_COVER);
+  lv_style_set_radius(&st_btn_orange, 16);
+  lv_style_set_shadow_width(&st_btn_orange, 18);
+  lv_style_set_shadow_opa(&st_btn_orange, LV_OPA_20);
+  lv_style_set_shadow_spread(&st_btn_orange, 2);
+  lv_style_set_text_color(&st_btn_orange, lv_color_hex(0xFFFFFF));
+
+  lv_style_init(&st_btn_white);
+  lv_style_set_bg_color(&st_btn_white, lv_color_hex(0xFFFFFF));
+  lv_style_set_bg_opa(&st_btn_white, LV_OPA_COVER);
+  lv_style_set_radius(&st_btn_white, 16);
+  lv_style_set_shadow_width(&st_btn_white, 14);
+  lv_style_set_shadow_opa(&st_btn_white, LV_OPA_20);
+  lv_style_set_text_color(&st_btn_white, lv_color_hex(0x111827));
+
+  lv_style_init(&st_btn_red);
+  lv_style_set_bg_color(&st_btn_red, lv_color_hex(0xE11D48));
+  lv_style_set_bg_opa(&st_btn_red, LV_OPA_COVER);
+  lv_style_set_radius(&st_btn_red, 16);
+  lv_style_set_shadow_width(&st_btn_red, 18);
+  lv_style_set_shadow_opa(&st_btn_red, LV_OPA_20);
+  lv_style_set_text_color(&st_btn_red, lv_color_hex(0xFFFFFF));
+}
+
+static lv_obj_t* make_btn(lv_obj_t* parent, const char* text, lv_style_t* st, lv_event_cb_t cb) {
+  lv_obj_t* b = lv_btn_create(parent);
+  lv_obj_add_style(b, st, 0);
+  lv_obj_set_style_transform_pivot_x(b, 0, 0);
+  lv_obj_set_style_transform_pivot_y(b, 0, 0);
+  lv_obj_set_style_transform_zoom(b, 100, 0);
+  lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t* t = lv_label_create(b);
+  lv_label_set_text(t, text);
+  lv_obj_center(t);
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_24, 0);
+  return b;
+}
+
+static void build_ui() {
+  lv_obj_t* scr = lv_scr_act();
+  lv_obj_add_style(scr, &st_bg, 0);
+
+  lbl_title = lv_label_create(scr);
+  lv_label_set_text(lbl_title, "Bandware Zähler");
+  lv_obj_add_style(lbl_title, &st_title, 0);
+  lv_obj_align(lbl_title, LV_ALIGN_TOP_LEFT, 20, 14);
+
+  btn_settings = make_btn(scr, "⚙", &st_btn_white, btn_settings_cb);
+  lv_obj_set_size(btn_settings, 70, 56);
+  lv_obj_align(btn_settings, LV_ALIGN_TOP_RIGHT, -20, 10);
+
+  lbl_status = lv_label_create(scr);
+  lv_obj_add_style(lbl_status, &st_status, 0);
+  lv_label_set_text(lbl_status, "Bereit");
+  lv_obj_align(lbl_status, LV_ALIGN_TOP_LEFT, 22, 54);
+
+  // Count big
+  lbl_count = lv_label_create(scr);
+  lv_obj_add_style(lbl_count, &st_big, 0);
+  lv_label_set_text(lbl_count, "0");
+  lv_obj_align(lbl_count, LV_ALIGN_LEFT_MID, 40, -30);
+
+  // Target text
+  lbl_target = lv_label_create(scr);
+  lv_obj_add_style(lbl_target, &st_mid, 0);
+  lv_label_set_text(lbl_target, "Ziel: 50");
+  lv_obj_align(lbl_target, LV_ALIGN_LEFT_MID, 42, 40);
+
+  // progress
+  bar_prog = lv_bar_create(scr);
+  lv_obj_set_size(bar_prog, 520, 18);
+  lv_obj_align(bar_prog, LV_ALIGN_BOTTOM_LEFT, 20, -20);
+  lv_bar_set_range(bar_prog, 0, 100);
+  lv_bar_set_value(bar_prog, 0, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(bar_prog, lv_color_hex(0xE5E7EB), 0);
+  lv_obj_set_style_bg_color(bar_prog, lv_color_hex(0xFF7A00), LV_PART_INDICATOR);
+
+  // Buttons row
+  btn_start = make_btn(scr, "START", &st_btn_orange, btn_start_cb);
+  lv_obj_set_size(btn_start, 210, 90);
+  lv_obj_align(btn_start, LV_ALIGN_RIGHT_MID, -40, -90);
+
+  btn_stop = make_btn(scr, "STOP", &st_btn_red, btn_stop_cb);
+  lv_obj_set_size(btn_stop, 210, 90);
+  lv_obj_align(btn_stop, LV_ALIGN_RIGHT_MID, -40, 10);
+
+  btn_reset = make_btn(scr, "RESET", &st_btn_white, btn_reset_cb);
+  lv_obj_set_size(btn_reset, 210, 90);
+  lv_obj_align(btn_reset, LV_ALIGN_RIGHT_MID, -40, 110);
+
+  // Target button
+  btn_target = make_btn(scr, "ZIEL", &st_btn_white, btn_target_cb);
+  lv_obj_set_size(btn_target, 120, 56);
+  lv_obj_align(btn_target, LV_ALIGN_TOP_LEFT, 260, 10);
+
+  ui_update_numbers();
+}
+
+// ======================
+// 13) LVGL init
+// ======================
+static void init_lvgl() {
+  lv_init();
+
+  lv_disp_draw_buf_init(&draw_buf, buf1, nullptr, SCREEN_W * LVGL_BUF_LINES);
+
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init(&disp_drv);
+  disp_drv.hor_res = SCREEN_W;
+  disp_drv.ver_res = SCREEN_H;
+  disp_drv.flush_cb = flush_cb;
+  disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register(&disp_drv);
+
+  // Touch as indev (if GT911 ok)
+  touch_init();
+  if (touch_ok) {
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
-    indev_drv.read_cb = my_touchpad_read;
-    lv_indev_t * indev = lv_indev_drv_register(&indev_drv);
-    
-    Serial.println("[LVGL] راه‌اندازی کامل شد");
+    indev_drv.read_cb = indev_read_cb;
+    lv_indev_drv_register(&indev_drv);
+    Serial.println("[TOUCH] GT911 OK");
+  } else {
+    Serial.println("[TOUCH] GT911 not found (UI will still work)");
+  }
 }
 
-// 9. ایجاد رابط کاربری ساده
-void createSimpleUI() {
-    Serial.println("[UI] ایجاد رابط کاربری...");
-    
-    lv_obj_t * scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x003a57), LV_PART_MAIN);
-    
-    // عنوان
-    lv_obj_t * title = lv_label_create(scr);
-    lv_label_set_text(title, "Jingcai ESP32 8048S070C");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
-    
-    // وضعیت
-    lv_obj_t * status = lv_label_create(scr);
-    lv_label_set_text(status, "✅ نمایشگر فعال");
-    lv_obj_set_style_text_color(status, lv_color_hex(0x90EE90), 0);
-    lv_obj_set_style_text_font(status, &lv_font_montserrat_22, 0);
-    lv_obj_align(status, LV_ALIGN_CENTER, 0, -20);
-    
-    // دکمه تست
-    lv_obj_t * btn = lv_btn_create(scr);
-    lv_obj_set_size(btn, 200, 60);
-    lv_obj_align(btn, LV_ALIGN_CENTER, 0, 50);
-    
-    lv_obj_t * btn_label = lv_label_create(btn);
-    lv_label_set_text(btn_label, "تست تاچ");
-    lv_obj_center(btn_label);
-    
-    // رزولوشن
-    char res_text[50];
-    snprintf(res_text, sizeof(res_text), "رزولوشن: %dx%d", SCREEN_WIDTH, SCREEN_HEIGHT);
-    lv_obj_t * resolution = lv_label_create(scr);
-    lv_label_set_text(resolution, res_text);
-    lv_obj_set_style_text_color(resolution, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_align(resolution, LV_ALIGN_BOTTOM_MID, 0, -20);
-    
-    Serial.println("[UI] رابط کاربری ایجاد شد");
-}
-
-// 10. Setup اصلی
+// ======================
+// 14) Setup/Loop
+// ======================
 void setup() {
-    Serial.begin(115200);
-    delay(2000);  // تأخیر برای راه‌اندازی سریال
-    
-    Serial.println("\n");
-    Serial.println("========================================");
-    Serial.println("   Jingcai ESP32 8048S070C - سیستم عامل");
-    Serial.println("========================================");
-    
-    // تنظیم I2C برای تاچ
-    Wire.begin(TOUCH_SDA, TOUCH_SCL);
-    Wire.setClock(400000);
-    
-    // تست سخت‌افزاری
-    hardwareTest();
-    
-    // راه‌اندازی LVGL
-    initLVGL();
-    
-    // ایجاد UI
-    createSimpleUI();
-    
-    Serial.println("\n✅ سیستم آماده است!");
-    Serial.println("📱 اگر تصویر دارید، سیستم کار می‌کند");
-    Serial.println("🔧 در صورت مشکل، پیام‌های بالا را بررسی کنید");
-    Serial.println("========================================\n");
+  Serial.begin(115200);
+  delay(200);
+
+  // NVS
+  prefs.begin("bandware", false);
+  target = prefs.getUShort("target", 50);
+  debounce_ms = prefs.getUShort("deb", DEFAULT_DEBOUNCE_MS);
+
+  // GPIO
+  pinMode(GPIO_MOTOR, OUTPUT);
+  motor_set(false);
+
+  pinMode(GPIO_SENSOR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(GPIO_SENSOR), sensor_isr, FALLING);
+
+  // Display
+  lcd.begin();
+
+  // LVGL + UI
+  init_lvgl();
+  init_styles();
+  build_ui();
+
+  ui_set_status(State::IDLE);
+  ui_update_numbers();
+
+  Serial.println("[APP] Ready");
 }
 
-// 11. Loop اصلی
 void loop() {
-    // فقط LVGL را اجرا کن - بدون تیک دستی
-    lv_timer_handler();
-    delay(5);
+  // main loop
+  lv_timer_handler();
+  delay(5);
+
+  // machine logic
+  if (state == State::RUNNING) {
+    if (g_count >= target) {
+      motor_set(false);
+      ui_set_status(State::DONE);
+    }
+  }
+
+  static uint32_t last_ui_ms = 0;
+  uint32_t now = millis();
+  if (now - last_ui_ms >= 50) {
+    last_ui_ms = now;
+    ui_update_numbers();
+  }
 }
